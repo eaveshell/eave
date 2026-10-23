@@ -7,14 +7,17 @@
 //! asking for a password when a network needs one. Each network has a details page. Without iwd
 //! it shows what the kernel knows: the connection, its address and gateway.
 //!
-//! In the dormer it turns Wi-Fi on and off, leaves the network it's on, and joins saved and open
-//! networks in range. For those it reads iwd once at start and after each, without watching it.
+//! In the dormer it turns Wi-Fi on and off, restarts it, leaves the network it's on, and joins
+//! saved and open networks in range.
+//!
+//! iwd is watched all the time, so the dormer acts on what's true now, and the bar item never
+//! says online while iwd says the station isn't on a network.
 
 use std::fmt;
 
 use eave_api::ui::{self, Action, Icon, Item, Node, Panel, Tone};
 use eave_api::{Effect, Registry, Subscription, Task, Widget};
-use eave_iwd::{Access, Diagnostics, Network as Wlan, Security, Station, Wifi};
+use eave_iwd::{Access, Diagnostics, Network as Wlan, Security, State as Link, Station, Wifi};
 use eave_net::{Connection, Kind, Network as Status, State};
 use serde::Deserialize;
 
@@ -32,8 +35,7 @@ pub struct Config {
 pub struct Network {
     show_name: bool,
     status: Status,
-    /// What iwd says, watched only while the popover is open. Kept after it closes, so the list
-    /// shows at once next time and is brought up to date.
+    /// What iwd says. `None` until it first answers.
     wifi: Option<Wifi>,
     open: bool,
     page: Page,
@@ -44,6 +46,10 @@ pub struct Network {
     joining: Option<String>,
     /// The last network that couldn't be joined, and why.
     failed: Option<(String, String)>,
+    /// Why the last command (power, leaving, forgetting…) failed.
+    problem: Option<String>,
+    /// A command on the device is running; others wait for it.
+    busy: bool,
     /// Scan once iwd first answers after opening.
     scan_when_ready: bool,
     diagnostics: Option<Diagnostics>,
@@ -84,7 +90,7 @@ pub enum Message {
     Reveal,
     Submit,
     /// Joining a network ended, by object path: how, or why not.
-    Joined(String, Result<(), String>),
+    Joined(String, Result<(), Failure>),
     Details(String),
     ConnectionDetails,
     Diagnostics(Option<Diagnostics>),
@@ -92,8 +98,17 @@ pub enum Message {
     Disconnect,
     Forget(String),
     AutoJoin(String, bool),
-    /// A command finished; what it changed arrives from iwd.
-    Done,
+    /// Turns Wi-Fi off and on again, for a device stuck failing every join.
+    Restart,
+    /// A command finished, or why it failed; what it changed arrives from iwd.
+    Done(Result<(), String>),
+}
+
+/// Why a join failed, and whether typing the password again might help.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    why: String,
+    password: bool,
 }
 
 impl Widget for Network {
@@ -111,11 +126,12 @@ impl Widget for Network {
             revealed: false,
             joining: None,
             failed: None,
+            problem: None,
+            busy: false,
             scan_when_ready: false,
             diagnostics: None,
         };
-        // What Wi-Fi there is, for the dormer's actions, without watching iwd.
-        (network, read())
+        (network, Task::none())
     }
 
     fn update(&mut self, message: Message) -> Effect<Message> {
@@ -123,6 +139,12 @@ impl Widget for Network {
             Message::Read(status) => self.status = status,
             Message::Wifi(wifi) => {
                 self.wifi = Some(wifi);
+                // Joined, however the reply is doing.
+                if let Some(path) = &self.joining
+                    && self.network(path).is_some_and(|network| network.connected)
+                {
+                    self.joining = None;
+                }
                 if std::mem::take(&mut self.scan_when_ready) {
                     return self.scan();
                 }
@@ -140,10 +162,18 @@ impl Widget for Network {
             }
             Message::Scan => return self.scan(),
             Message::Power(on) => {
-                let Some(station) = self.station().cloned() else {
+                let Some(station) = self.idle_station() else {
                     return Effect::none();
                 };
-                return command(async move { eave_iwd::set_powered(&station, on).await });
+                return self.command(async move { eave_iwd::set_powered(&station, on).await });
+            }
+            Message::Restart => {
+                let Some(station) = self.idle_station() else {
+                    return Effect::none();
+                };
+                self.joining = None;
+                self.failed = None;
+                return self.command(async move { eave_iwd::restart(&station).await });
             }
             Message::Join(path) => {
                 let Some(network) = self.network(&path).cloned() else {
@@ -187,18 +217,15 @@ impl Widget for Network {
                 if self.joining.as_ref() == Some(&path) {
                     self.joining = None;
                 }
-                if let Err(why) = result {
+                if let Err(failure) = result {
                     let secured = self
                         .network(&path)
-                        .is_some_and(|network| network.known.is_none());
+                        .is_some_and(|network| network.security == Security::Psk);
                     // Back to the password, unless they've moved on since.
-                    if secured && self.open && self.page == Page::List {
+                    if secured && failure.password && self.open && self.page == Page::List {
                         self.page = Page::Password(path.clone());
                     }
-                    self.failed = Some((path, why));
-                }
-                if !self.open {
-                    return read().into();
+                    self.failed = Some((path, failure.why));
                 }
             }
             Message::Details(path) => {
@@ -218,47 +245,46 @@ impl Widget for Network {
                 self.page = Page::List;
             }
             Message::Disconnect => {
-                let Some(station) = self.station().cloned() else {
+                let Some(station) = self.idle_station() else {
                     return Effect::none();
                 };
                 self.page = Page::List;
-                return command(async move { eave_iwd::disconnect(&station).await });
+                return self.command(async move { eave_iwd::disconnect(&station).await });
             }
             Message::Forget(path) => {
                 let Some(known) = self.network(&path).and_then(|n| n.known.clone()) else {
                     return Effect::none();
                 };
                 self.page = Page::List;
-                return command(async move { eave_iwd::forget(&known).await });
+                return self.command(async move { eave_iwd::forget(&known).await });
             }
             Message::AutoJoin(path, on) => {
                 let Some(known) = self.network(&path).and_then(|n| n.known.clone()) else {
                     return Effect::none();
                 };
-                return command(async move { eave_iwd::set_autoconnect(&known, on).await });
+                return self.command(async move { eave_iwd::set_autoconnect(&known, on).await });
             }
-            // Picked from the dormer: the popover isn't watching iwd, so read what changed.
-            Message::Done if !self.open => return read().into(),
-            Message::Done => {}
+            Message::Done(result) => {
+                self.busy = false;
+                self.problem = result.err();
+            }
         }
         Effect::none()
     }
 
     fn subscription(&self) -> Subscription<Message> {
         let kernel = Subscription::run(eave_net::watch).map(Message::Read);
-        if !self.open {
-            return kernel;
-        }
         let iwd = Subscription::run(eave_iwd::watch).map(Message::Wifi);
         Subscription::batch([kernel, iwd])
     }
 
     fn item(&self) -> Item<Message> {
-        let tone = match self.status.state {
+        let state = self.state();
+        let tone = match state {
             State::Online => Tone::Normal,
             State::Connecting | State::Offline => Tone::Dim,
         };
-        let content = match (self.status.state, &self.status.primary) {
+        let content = match (state, &self.status.primary) {
             (State::Connecting | State::Offline, _) | (_, None) => {
                 ui::icon(Icon::Wifi { strength: None })
             }
@@ -328,6 +354,11 @@ impl Widget for Network {
                 .id("wifi-off")
                 .keywords(words.into_iter().chain(["disable", "airplane"]))
                 .leading(ui::icon(Icon::Wifi { strength: None })),
+            ui::action("Restart Wi-Fi", Message::Restart)
+                .id("wifi-restart")
+                .subtitle("Turns it off and on again")
+                .keywords(words.into_iter().chain(["reset", "reconnect", "fix"]))
+                .leading(ui::icon(Icon::Refresh)),
         ];
         for network in &station.networks {
             let path = network.path.as_str();
@@ -369,6 +400,44 @@ impl Network {
         self.wifi.as_ref()?.station.as_ref()
     }
 
+    /// The station, unless a command on it is still running: one at a time, so clicks don't
+    /// pile up on a device that's slow to answer.
+    fn idle_station(&self) -> Option<Station> {
+        (!self.busy).then(|| self.station().cloned())?
+    }
+
+    /// The kernel's word on the connection, unless iwd knows better: a route can outlive the
+    /// network it went through, and the kernel can't tell joining from offline.
+    fn state(&self) -> State {
+        let state = self.status.state;
+        let (Some(station), Some(connection)) = (self.ready(), &self.status.primary) else {
+            return state;
+        };
+        let on_wifi = matches!(connection.kind, Kind::Wifi { .. })
+            && connection.interface == station.interface;
+        match station.state {
+            _ if !on_wifi || state != State::Online => state,
+            Link::Connected | Link::Roaming => state,
+            Link::Connecting => State::Connecting,
+            Link::Disconnected | Link::Disconnecting => State::Offline,
+        }
+    }
+
+    fn command(
+        &mut self,
+        work: impl Future<Output = eave_iwd::zbus::Result<()>> + Send + 'static,
+    ) -> Effect<Message> {
+        self.busy = true;
+        self.problem = None;
+        Task::future(async move {
+            Message::Done(work.await.map_err(|error| {
+                eprintln!("eave-network: {error}");
+                problem(&error).to_string()
+            }))
+        })
+        .into()
+    }
+
     /// The station, when iwd can be used.
     fn ready(&self) -> Option<&Station> {
         let wifi = self.wifi.as_ref()?;
@@ -390,7 +459,14 @@ impl Network {
 
     fn scan(&mut self) -> Effect<Message> {
         match self.ready().filter(|station| station.powered).cloned() {
-            Some(station) => command(async move { eave_iwd::scan(&station).await }),
+            // Not `command`: a scan iwd turns down (busy joining) isn't worth saying.
+            Some(station) => Task::future(async move {
+                if let Err(error) = eave_iwd::scan(&station).await {
+                    eprintln!("eave-network: scan: {error}");
+                }
+                Message::Done(Ok(()))
+            })
+            .into(),
             None => Effect::none(),
         }
     }
@@ -416,6 +492,19 @@ impl Network {
             Message::Power(!station.powered),
         ));
         let mut lines = vec![header];
+        if let Some(problem) = &self.problem {
+            lines.push(ui::label(problem.clone()).tone(Tone::Critical));
+        }
+        // A join that failed, or one that doesn't end: the device may be stuck.
+        let stuck = self.failed.is_some()
+            || (station.state == Link::Connecting && self.joining.is_none());
+        if station.powered && stuck {
+            lines.push(ui::row([
+                ui::label("Not joining?").tone(Tone::Dim),
+                ui::fill(),
+                ui::button(ui::label("Restart Wi-Fi"), Message::Restart),
+            ]));
+        }
         let wired =
             self.status.primary.as_ref().filter(|connection| {
                 matches!(connection.kind, Kind::Wired | Kind::Other | Kind::Vpn)
@@ -429,7 +518,9 @@ impl Network {
         }
         let (current, others): (Vec<&Wlan>, Vec<&Wlan>) =
             station.networks.iter().partition(|network| {
-                network.connected || self.joining.as_deref() == Some(network.path.as_str())
+                network.connected
+                    || network.connecting
+                    || self.joining.as_deref() == Some(network.path.as_str())
             });
         if !current.is_empty() {
             lines.push(ui::list(
@@ -461,7 +552,7 @@ impl Network {
     /// password, and an info button for the current one and saved ones.
     fn row(&self, network: &Wlan) -> Node<Message> {
         let path = network.path.as_str().to_string();
-        let joining = self.joining.as_deref() == Some(path.as_str());
+        let joining = self.joining.as_deref() == Some(path.as_str()) || network.connecting;
         let failed = self
             .failed
             .as_ref()
@@ -713,28 +804,35 @@ fn band(frequency: u32) -> Option<&'static str> {
     }
 }
 
-fn reason(result: eave_iwd::zbus::Result<()>) -> Result<(), String> {
-    result.map_err(|error| {
-        eprintln!("eave-network: {error}");
-        eave_iwd::reason(&error).to_string()
-    })
-}
-
-/// What iwd says now, once.
-fn read() -> Task<Message> {
-    Task::future(eave_iwd::read()).and_then(|wifi| Task::done(Message::Wifi(wifi)))
-}
-
-fn command(
-    work: impl Future<Output = eave_iwd::zbus::Result<()>> + Send + 'static,
-) -> Effect<Message> {
-    Task::future(async move {
-        if let Err(error) = work.await {
+fn reason(result: eave_iwd::zbus::Result<()>) -> Result<(), Failure> {
+    match result {
+        // Another join took its place; that one's result is the one to show.
+        Err(error) if eave_iwd::superseded(&error) => Ok(()),
+        Err(error) => {
             eprintln!("eave-network: {error}");
+            Err(Failure {
+                why: eave_iwd::reason(&error).to_string(),
+                password: eave_iwd::wants_password(&error),
+            })
         }
-        Message::Done
-    })
-    .into()
+        Ok(()) => Ok(()),
+    }
+}
+
+/// Why a command other than joining failed, in a few words.
+fn problem(error: &eave_iwd::zbus::Error) -> &'static str {
+    match error {
+        eave_iwd::zbus::Error::MethodError(name, ..) => {
+            match name.as_str().rsplit('.').next().unwrap_or("") {
+                "AccessDenied" | "PermissionDenied" => "Not allowed to change Wi-Fi",
+                "Busy" | "InProgress" => "Wi-Fi is busy. Try again in a moment",
+                "NotAvailable" | "NotSupported" => "Wi-Fi can't do that right now",
+                _ => "Wi-Fi didn't respond",
+            }
+        }
+        eave_iwd::zbus::Error::InputOutput(_) => "Couldn't reach iwd",
+        _ => "Wi-Fi didn't answer in time",
+    }
 }
 
 #[cfg(test)]
@@ -824,6 +922,7 @@ mod tests {
                 autoconnect: true,
             }),
             connected,
+            connecting: false,
         }
     }
 
@@ -844,7 +943,7 @@ mod tests {
             interface: "wlan0".into(),
             address: String::new(),
             powered: true,
-            state: "connected".into(),
+            state: Link::Connected,
             scanning: false,
             networks: vec![
                 wlan("home", Security::Psk, true, true),
@@ -861,6 +960,7 @@ mod tests {
             titles(&network),
             [
                 "Turn Wi-Fi off",
+                "Restart Wi-Fi",
                 "Disconnect from home",
                 "Join office",
                 "Join cafe"
@@ -874,6 +974,56 @@ mod tests {
             }),
         }));
         assert_eq!(titles(&network), ["Turn Wi-Fi on"]);
+    }
+
+    fn station(state: Link) -> Station {
+        Station {
+            device: path("/dev"),
+            interface: "wlan0".into(),
+            address: String::new(),
+            powered: true,
+            state,
+            scanning: false,
+            networks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn iwd_overrules_a_lingering_route() {
+        let mut network = network(State::Online, Some(wifi()));
+        let strong = Some(Icon::Wifi {
+            strength: Some(0.7),
+        });
+        assert_eq!(icon(&network), strong, "the kernel alone");
+        for (link, shown) in [
+            (Link::Connected, strong),
+            (Link::Roaming, strong),
+            (Link::Disconnected, Some(Icon::Wifi { strength: None })),
+            (Link::Connecting, Some(Icon::Wifi { strength: None })),
+        ] {
+            network.update(Message::Wifi(Wifi {
+                access: Access::Ready,
+                station: Some(station(link)),
+            }));
+            assert_eq!(icon(&network), shown, "{link:?}");
+        }
+    }
+
+    #[test]
+    fn one_command_at_a_time() {
+        let mut network = network(State::Online, Some(wifi()));
+        network.update(Message::Wifi(Wifi {
+            access: Access::Ready,
+            station: Some(station(Link::Connected)),
+        }));
+        network.update(Message::Disconnect);
+        assert!(network.busy);
+        assert!(network.idle_station().is_none(), "the next waits");
+        network.update(Message::Done(Err("Wi-Fi didn't respond".into())));
+        assert!(!network.busy);
+        assert_eq!(network.problem.as_deref(), Some("Wi-Fi didn't respond"));
+        network.update(Message::Power(false));
+        assert_eq!(network.problem, None, "a new command clears the old problem");
     }
 
     #[test]

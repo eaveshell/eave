@@ -53,11 +53,40 @@ pub struct Station {
     /// The device's MAC address.
     pub address: String,
     pub powered: bool,
-    /// iwd's word for it: `connected`, `connecting`, `disconnected`, `roaming`…
-    pub state: String,
+    pub state: State,
     pub scanning: bool,
     /// Strongest first, the connected one among them.
     pub networks: Vec<Network>,
+}
+
+/// Where a station is with its network. iwd's `State`, the one word on whether Wi-Fi is
+/// connected: a network's own `Connected` can lag behind it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum State {
+    #[default]
+    Disconnected,
+    Connecting,
+    Connected,
+    /// Moving to another access point of the same network; still connected.
+    Roaming,
+    Disconnecting,
+}
+
+impl State {
+    fn from_iwd(state: &str) -> Self {
+        match state {
+            "connected" => Self::Connected,
+            "connecting" => Self::Connecting,
+            "roaming" => Self::Roaming,
+            "disconnecting" => Self::Disconnecting,
+            _ => Self::Disconnected,
+        }
+    }
+
+    /// On a network, roaming or not.
+    pub fn is_connected(self) -> bool {
+        matches!(self, Self::Connected | Self::Roaming)
+    }
 }
 
 /// A network in range.
@@ -73,6 +102,8 @@ pub struct Network {
     /// Set when iwd remembers it.
     pub known: Option<Known>,
     pub connected: bool,
+    /// Being joined, by eave or by iwd on its own.
+    pub connecting: bool,
 }
 
 /// A network iwd remembers.
@@ -126,8 +157,8 @@ pub async fn read() -> Option<Wifi> {
     std::pin::pin!(watch()).next().await
 }
 
-/// Wi-Fi now, then again after every change iwd signals. Meant to be watched only while
-/// something shows it, like an open popover: iwd is chatty while it scans.
+/// Wi-Fi now, then again after every change iwd signals, and when iwd starts or stops. iwd is
+/// quiet unless something happens, and chatty while it scans.
 pub fn watch() -> impl Stream<Item = Wifi> {
     eave_dbus::watch_all(SERVICE, snapshot)
 }
@@ -254,18 +285,28 @@ impl Objects {
         let empty = Properties::new();
         let properties = self.interface(device.as_str(), DEVICE).unwrap_or(&empty);
         let station = self.interface(device.as_str(), STATION);
+        let state = State::from_iwd(
+            &station
+                .map(|station| get::<String>(station, "State"))
+                .unwrap_or_default(),
+        );
+        let current = station.and_then(|station| object_path(station, "ConnectedNetwork"));
         let networks = ordered
             .iter()
-            .filter_map(|(path, signal)| self.network(path, *signal))
+            .filter_map(|(path, signal)| {
+                let mut network = self.network(path, *signal)?;
+                let current = current.as_ref() == Some(path);
+                network.connected = current && state.is_connected();
+                network.connecting = current && state == State::Connecting;
+                Some(network)
+            })
             .collect();
         Station {
             device: device.clone(),
             interface: get(properties, "Name"),
             address: get(properties, "Address"),
             powered: get(properties, "Powered"),
-            state: station
-                .map(|station| get(station, "State"))
-                .unwrap_or_default(),
+            state,
             scanning: station.is_some_and(|station| get(station, "Scanning")),
             networks,
         }
@@ -292,6 +333,7 @@ impl Objects {
             signal: dbm,
             known,
             connected: get(network, "Connected"),
+            connecting: false,
         })
     }
 }
@@ -338,13 +380,49 @@ pub async fn scan(station: &Station) -> zbus::Result<()> {
     call(&station.device, STATION, "Scan").await
 }
 
-/// Joins a network iwd remembers, or an open one.
+/// Joins a network iwd remembers, or an open one. iwd leaves the current network itself. If a
+/// remembered password no longer works, iwd asks eave's agent, which says no: the join fails
+/// and the password can be typed again.
 pub async fn connect(network: &Network) -> zbus::Result<()> {
+    agent::register().await?;
     call(&network.path, NETWORK, "Connect").await
 }
 
+/// Leaves the network. iwd then stops joining networks on its own until the next join. Already
+/// off a network is done.
 pub async fn disconnect(station: &Station) -> zbus::Result<()> {
-    call(&station.device, STATION, "Disconnect").await
+    match call(&station.device, STATION, "Disconnect").await {
+        Err(error) if error_name(&error) == Some("NotConnected") => Ok(()),
+        result => result,
+    }
+}
+
+/// Turns the Wi-Fi device off and on again. Broadcom firmware (on Apple Silicon Macs) can get
+/// stuck failing every join until it's restarted; this restarts it without a reboot.
+pub async fn restart(station: &Station) -> zbus::Result<()> {
+    set_powered(station, false).await?;
+    set_powered(station, true).await
+}
+
+/// iwd's short name for an error, like `Failed` or `NotConnected`.
+fn error_name(error: &zbus::Error) -> Option<&str> {
+    match error {
+        zbus::Error::MethodError(name, ..) => name.as_str().rsplit('.').next(),
+        _ => None,
+    }
+}
+
+/// The join failed in a way a different password might fix.
+pub fn wants_password(error: &zbus::Error) -> bool {
+    matches!(
+        error_name(error),
+        Some("Failed" | "AuthenticationFailed" | "InvalidFormat" | "Canceled")
+    )
+}
+
+/// The join was replaced by another one before it finished: not a failure to show.
+pub fn superseded(error: &zbus::Error) -> bool {
+    error_name(error) == Some("Aborted")
 }
 
 /// Forgets a remembered network: its password, and joining it on its own.
@@ -392,11 +470,10 @@ pub async fn diagnostics(station: &Station) -> zbus::Result<Diagnostics> {
 
 /// A short reason an iwd call failed, fit to show under a password field.
 pub fn reason(error: &zbus::Error) -> &'static str {
-    let name = match error {
-        zbus::Error::MethodError(name, ..) => name.as_str(),
-        _ => return "Couldn't reach iwd",
+    let Some(name) = error_name(error) else {
+        return "Couldn't reach iwd";
     };
-    match name.rsplit('.').next().unwrap_or("") {
+    match name {
         "InvalidFormat" => "That password isn't valid for this network",
         "Failed" | "AuthenticationFailed" => "Couldn't join. Check the password and try again",
         "Aborted" | "Canceled" => "Joining was cancelled",
@@ -405,6 +482,9 @@ pub fn reason(error: &zbus::Error) -> &'static str {
         "NotConfigured" => "This network needs setting up first",
         "AccessDenied" => "Not allowed to change Wi-Fi",
         "Timeout" => "The network didn't answer",
+        "NotFound" => "The network is out of range",
+        "NoAgent" => "No one to ask for the password",
+        "NotAvailable" => "Wi-Fi is off",
         _ => "Couldn't join the network",
     }
 }
@@ -438,6 +518,10 @@ mod tests {
             Properties::from([
                 ("State".into(), value("connected")),
                 ("Scanning".into(), value(false)),
+                (
+                    "ConnectedNetwork".into(),
+                    value(object("/net/connman/iwd/0/2/home_psk")),
+                ),
             ]),
         );
         objects.insert("/net/connman/iwd/0/2".to_string(), device);
@@ -483,7 +567,7 @@ mod tests {
         let station = objects.station(&device, &ordered);
         assert_eq!(station.interface, "wlan0");
         assert!(station.powered);
-        assert_eq!(station.state, "connected");
+        assert_eq!(station.state, State::Connected);
         assert_eq!(
             station.networks.len(),
             2,

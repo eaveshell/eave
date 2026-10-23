@@ -84,13 +84,14 @@ impl Agent {
     }
 }
 
-/// Joins `network` with `passphrase`. iwd remembers it once it works.
-pub async fn connect_with(network: &Network, passphrase: String) -> zbus::Result<()> {
+/// Serves eave's agent and makes it the one iwd asks for joins eave starts. Every time, so it
+/// holds after iwd restarts, or after the bus connection was opened again.
+pub(crate) async fn register() -> zbus::Result<()> {
     let connection = eave_dbus::system().await?;
     // Served once per connection; `at` says false when it already is.
     connection.object_server().at(AGENT, Agent).await?;
-    // Registered every time, so it holds even after iwd restarts. iwd sends the request to the
-    // agent of whoever called Connect, so another program's agent doesn't get it.
+    // iwd sends the request to the agent of whoever called Connect, so another program's agent
+    // doesn't get it.
     let agent = OwnedObjectPath::try_from(AGENT)?;
     match connection
         .call_method(
@@ -102,11 +103,18 @@ pub async fn connect_with(network: &Network, passphrase: String) -> zbus::Result
         )
         .await
     {
-        Ok(_) => {}
-        Err(zbus::Error::MethodError(name, ..)) if name.as_str().ends_with("AlreadyExists") => {}
-        Err(error) => return Err(error),
+        Ok(_) => Ok(()),
+        Err(zbus::Error::MethodError(name, ..)) if name.as_str().ends_with("AlreadyExists") => {
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
+}
 
+/// Joins `network` with `passphrase`. iwd remembers it once it works.
+pub async fn connect_with(network: &Network, passphrase: String) -> zbus::Result<()> {
+    register().await?;
+    let connection = eave_dbus::system().await?;
     *WAITING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) =
