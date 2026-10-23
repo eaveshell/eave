@@ -78,6 +78,7 @@ Current baseline (Asahi, aarch64, release, tiny-skia, default binary). Measured 
 | a clock, + `bluetooth` with BlueZ running and a paired device (after D-103; Asahi, both renderers built in, run on tiny-skia) | 19.15 → 19.84 MiB | ~18.8 MB for the clock alone, ~19.1–19.5 MB with bluetooth, same session | 0% (one tick in 20 s either way) |
 | clock, volume, network, bluetooth (after D-132/D-133: drained D-Bus signals, iwd always watched; Asahi, both renderers built in, run on tiny-skia) | 21.59 → 21.72 MB | ~22.5 → ~22.8 MB, same session | unchanged: 1–4 ticks in 20 s either way |
 | two clocks, + `power` (after D-131; Asahi, both renderers built in, run on tiny-skia) | 20.09 → 20.59 MiB | ~19.1 MB for two clocks on main, ~19.4 MB on this build, ~19.6 MB with power, same session | 0%: nothing runs until the popover opens or an action is picked |
+| clock, battery with ebb recording (after D-134; Asahi, both renderers built in, run on tiny-skia) | 20.71 → 23.17 MiB (SQLite and ebb's models) | ~19.9 → ~23.0 MB, same session | unchanged: 15 vs 16 ticks in 120 s |
 
 Before the plugin split (skeleton, clock + date hard-coded): binary 5.6 MiB, RSS ~11.5 MB. The +0.2 MiB of binary and +0.3 MB of RSS are the price of the registry, config parsing (`toml`) and popover surfaces ([D-12](decisions.md), [D-14](decisions.md)).
 

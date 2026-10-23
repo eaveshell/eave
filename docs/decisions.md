@@ -339,7 +339,7 @@ An optional `dist/systemd/eave-rebuild.path` runs it whenever `plugins.toml` cha
 
 ## D-23: Core plugins depend only on Hyprland and the kernel
 
-**Status:** accepted (2026-10-12). Supersedes D-18's battery and network parts. Amended by [D-112](#d-112-glass-drawn-by-a-hyprland-plugin-that-eave-tells-whats-glass): glass needs a Hyprland plugin built from this repository. It's optional, and the bar is the same without it.
+**Status:** accepted (2026-10-12). Supersedes D-18's battery and network parts. Amended by [D-112](#d-112-glass-drawn-by-a-hyprland-plugin-that-eave-tells-whats-glass): glass needs a Hyprland plugin built from this repository. It's optional, and the bar is the same without it. Amended by [D-134](#d-134-battery-estimates-learned-by-ebb): the battery's time left comes from ebb's recording when there is one. ebb is optional too, and without it the battery reads the kernel as described here.
 
 **What:** the bar and its core plugins must work on any Hyprland machine without checking what else is installed. An audit found three plugins tied to this machine's setup:
 - `battery` read UPower. Minimal Hyprland installs often don't have it. It now reads `/sys/class/power_supply` directly (`plugins/battery/src/sysfs.rs`). System batteries (`type = Battery`, `scope` not `Device`, so a mouse doesn't count) are combined the way UPower's display device does it: percentage = stored energy / full energy (charge × design voltage when a driver only reports charge), and a state that is charging if any battery charges. Watts and time left come from `power_now` (or `current_now × voltage_now`), or from the kernel's own `time_to_*_now` for a single battery. One `eave-battery` thread blocks on a `NETLINK_KOBJECT_UEVENT` socket (rustix), so plugging in shows at once. Drivers don't send an event for every percent, so it also re-reads every 30 s, but only while a battery exists. A desktop never wakes.
@@ -3193,3 +3193,39 @@ Unplugged from its jack, the default goes back to what it was. A device that dis
 - The bar already watches every device (D-19).
 
 **Cost:** only while the bar runs. `set_default` is what choosing a device in the popover does, so WirePlumber remembers it as picked. Bluetooth mics follow too, as asked: recording from one switches the headphones to the headset profile, which sounds worse, until it stops.
+
+---
+
+## D-134: Battery estimates learned by ebb
+
+**Status:** accepted (2026-10-23). Amends [D-23](#d-23-core-plugins-depend-only-on-hyprland-and-the-kernel).
+
+**What:** when [ebb](https://github.com/francescomengarelli/ebb) records the machine, the battery widget uses it. ebb's collector (`ebb-collector.service`, a user unit) samples CPU, display, disk, network and programs every 10 s and learns what each costs in watts, how the charger behaves and what you tend to do next. The widget links the `ebb-battery` crate and reads that recording read-only. It shows:
+- **Time left with a range.** ebb simulates many futures, so the hero says `3 h 41 min until empty` with `likely 3 h 02 – 4 h 25` under it. The bar's hover stays the percent alone: with the time it grew too wide. When ebb has too little history, it holds the recent load or the gauge's reading, and the Power tab says which method it used and, dimmed, the kernel's own estimate to compare.
+- **What you seem to be doing**, under the meter: ebb's activity (`firefox · 9 W`, `12 min in, usually 25 min`), with the program's icon.
+- **What draws the power**, in an Apps tab, live while the popover is open. A thread takes two readings of `/proc` and `/sys` 3 s apart and applies ebb's power model (`power_between`), so programs and the display, GPU and baseline each get watts. Until the model has 2 h on battery, programs get their share of a core instead, and a dimmed line says how long until watts. The thread ends when the popover closes.
+- **More power details:** the charger's watts and the drain while suspended.
+
+Without a recording, nothing changes: the kernel's estimate, as in D-23, and a dimmed line in the popover pointing to `eave doctor`. With more than one battery ebb isn't used, because it follows only the first. **`eave doctor`** checks `ebb-collector.service` when config.toml has a battery widget and the machine has a battery. It says how to install ebb when the unit is missing and how to enable it when it's disabled. That check lives in core, since plugins can't add checks (D-96).
+
+**How it stays light:**
+- ebb has no events and no daemon, so the forecast runs on the battery thread's existing wakeups (uevents and the 30 s re-read). It's computed again every 5 minutes, or at once when the battery starts or stops charging. In between, the time left counts down by the clock.
+- A forecast costs ebb ~55 ms of CPU and a passing ~12 MB while it brings its models up to date from the recording. glibc would keep that memory for the battery thread, so `malloc_trim` hands it back after each forecast, and after the apps thread loads the power model. On non-glibc targets this is a no-op.
+
+**Alternatives:**
+- *`ebb --json` from the bar:* shelling out to a binary is ruled out (AGENTS.md), and it would cost a process start for each forecast.
+- *Reimplementing the models in the plugin:* that would mean ebb's recording, training and simulation all over again. ebb exists to do that.
+- *A cargo feature for ebb:* that keeps lean builds free of SQLite, at the price of two code paths to keep building. Turned down: one build, and ebb decides at runtime.
+- *D-Bus:* ebb doesn't offer it. It's a library plus a recording.
+- *A forecast every minute:* ~0.1% idle CPU for an estimate that moves by minutes.
+
+**Cost:** Asahi, release, tiny-skia, clock + battery, ebb recording:
+- Binary: 20.71 → 23.17 MiB (+2.45 MiB). This is SQLite (bundled by `ebb-store`'s rusqlite) and ebb's models.
+- RSS: ~19.9 → ~23.0 MB, same session.
+- Idle CPU: unchanged within noise (15 vs 16 ticks in 120 s).
+
+The apps thread runs only while the popover is open.
+
+**Could be cheaper, in ebb:**
+- A forecast that keeps its models between calls, instead of loading them and catching up from the recording each time.
+- `ebb-store` with fewer SQLite features. It enables FTS, R-tree and JSON, none of which the reader needs.

@@ -1,17 +1,27 @@
 //! Battery level, as a battery icon filled to the charge: green while charging, red when nearly
-//! empty. Hovering it shows the percentage instead, gulping while it charges. Read from the kernel's
-//! `/sys/class/power_supply`, with every system battery combined into one. Hidden when there's no
-//! battery (a desktop). The popover has the state, the time left and the power draw.
+//! empty. Hovering it shows the percentage instead, gulping while it charges.
+//! Read from the kernel's `/sys/class/power_supply`, with every system battery combined into one.
+//! Hidden when there's no battery (a desktop).
+//!
+//! When ebb records the machine ([`learned`]), the time left is ebb's: learned from how the
+//! machine is used, with a range, and the popover also says what you seem to be doing and, while
+//! it's open, which programs draw the power ([`apps`]). Without ebb it's the kernel's estimate,
+//! and the popover says ebb would do better.
 //!
 //! It sends a notification when the charger goes in, when the battery runs low and when it's done
 //! charging ([`notify`]).
 
-use eave_api::ui::{self, Icon, Item, Panel, Tone};
+use eave_api::ui::{self, Icon, Item, Node, Panel, Tone};
 use eave_api::{Effect, Registry, Subscription, Task, Widget};
 use serde::Deserialize;
 
+mod apps;
+mod learned;
 mod notify;
 mod sysfs;
+
+use apps::Apps;
+use learned::{Forecast, Method};
 
 pub fn register(registry: &mut Registry) {
     registry.widget::<Battery>("battery");
@@ -45,6 +55,8 @@ impl Default for Config {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Reading {
     present: bool,
+    /// How many batteries were combined.
+    batteries: usize,
     percentage: f64,
     state: State,
     /// Seconds, 0 when unknown.
@@ -66,6 +78,8 @@ pub struct Reading {
     charge_limit: Option<u8>,
     /// Whether a charger is plugged in, when the machine says.
     ac_online: Option<bool>,
+    /// ebb's forecast, when it records this machine.
+    forecast: Option<Box<Forecast>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -101,6 +115,10 @@ pub struct Battery {
     warning: Option<u32>,
     /// The id of the notification that the charger went in, once the server gave it.
     plugged: Option<u32>,
+    /// The popover is open: what draws the power is being measured.
+    open: bool,
+    /// What draws the power, since the popover opened.
+    apps: Option<Apps>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +128,9 @@ pub enum Message {
     Warned(u32),
     /// The notification that the charger went in went up, with this id.
     Plugged(u32),
+    Opened,
+    Closed,
+    Apps(Apps),
 }
 
 /// A notification to send or take away.
@@ -136,6 +157,8 @@ impl Widget for Battery {
             warned: false,
             warning: None,
             plugged: None,
+            open: false,
+            apps: None,
         };
         (battery, Task::none())
     }
@@ -159,11 +182,32 @@ impl Widget for Battery {
                 self.plugged = Some(id);
                 Effect::none()
             }
+            Message::Opened => {
+                self.open = true;
+                Effect::none()
+            }
+            Message::Closed => {
+                self.open = false;
+                self.apps = None;
+                Effect::none()
+            }
+            Message::Apps(apps) => {
+                if self.open {
+                    self.apps = Some(apps);
+                }
+                Effect::none()
+            }
         }
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::run(sysfs::watch).map(Message::Read)
+        let reading = Subscription::run(sysfs::watch).map(Message::Read);
+        // Only with ebb, and only while someone looks.
+        if self.open && self.reading.forecast.is_some() {
+            Subscription::batch([reading, Subscription::run(apps::watch).map(Message::Apps)])
+        } else {
+            reading
+        }
     }
 
     fn item(&self) -> Item<Message> {
@@ -190,21 +234,84 @@ impl Widget for Battery {
         }
         let reading = &self.reading;
         let percent = self.percent();
-        let limit = reading.charge_limit.map(|limit| format!("{limit}%"));
+        let hero = ui::row([
+            ui::display(ui::counter(percent.into(), 0..=100, "%")),
+            ui::fill(),
+            ui::column(self.outlook()),
+        ])
+        .tone(self.tone());
+        let mut meter = ui::meter(f32::from(percent) / 100.0).tone(self.tone());
+        if let Some(limit) = reading.charge_limit {
+            meter = meter.limit(f32::from(limit) / 100.0);
+        }
+        let mut parts = vec![hero, meter];
+        if let Some(activity) = reading.forecast.as_ref().and_then(|f| f.activity.as_ref()) {
+            parts.push(now(activity));
+        }
+
+        let mut tabs = Vec::new();
+        if reading.forecast.is_some() {
+            tabs.push(("Apps", self.apps()));
+        }
+        tabs.push(("Power", ui::column(self.power())));
+        let health = self.health();
+        if !health.is_empty() {
+            tabs.push(("Health", ui::column(health)));
+        }
+        parts.push(match tabs.len() {
+            1 => tabs.pop().map(|(_, page)| page).unwrap_or_else(ui::empty),
+            _ => ui::tabs(tabs),
+        });
+        // ebb follows one battery; with more there's nothing to suggest.
+        if reading.forecast.is_none() && reading.batteries == 1 {
+            parts.push(ui::separator());
+            parts.push(
+                ui::label("A steadier time left needs ebb: eave doctor says how").tone(Tone::Dim),
+            );
+        }
+        Some(
+            Panel::new(ui::column(parts))
+                .on_open(Message::Opened)
+                .on_close(Message::Closed),
+        )
+    }
+}
+
+impl Battery {
+    /// Beside the percentage: the time left and what it's until, with ebb's range under it, or
+    /// the state when there's no time to give.
+    fn outlook(&self) -> Vec<Node<Message>> {
+        let reading = &self.reading;
+        let estimate = reading
+            .forecast
+            .as_ref()
+            .and_then(|forecast| forecast.estimate.as_ref());
+        let until_full = match reading.charge_limit {
+            Some(limit) => format!("until {limit}%"),
+            None => "until full".into(),
+        };
         let (when, what) = match reading.state {
-            State::Charging if reading.time_to_full > 0 => {
-                (duration(reading.time_to_full), "until full".to_string())
+            State::Charging | State::Discharging => {
+                let charging = reading.state == State::Charging;
+                let what = if charging {
+                    until_full
+                } else {
+                    "until empty".into()
+                };
+                match self.left() {
+                    Some(seconds) => (duration(seconds), what),
+                    None if estimate.is_some_and(|e| e.beyond && e.to_full == charging) => {
+                        ("Over 2 days".into(), what)
+                    }
+                    None if charging => ("Charging".into(), String::new()),
+                    None => ("On battery".into(), String::new()),
+                }
             }
-            State::Charging => ("Charging".into(), String::new()),
-            State::Discharging if reading.time_to_empty > 0 => {
-                (duration(reading.time_to_empty), "until empty".to_string())
-            }
-            State::Discharging => ("On battery".into(), String::new()),
             State::Full => ("Fully charged".into(), String::new()),
             State::NotCharging => (
                 "Not charging".into(),
-                match &limit {
-                    Some(limit) => format!("held at the {limit} limit"),
+                match reading.charge_limit {
+                    Some(limit) => format!("held at the {limit}% limit"),
                     None => "plugged in".into(),
                 },
             ),
@@ -214,17 +321,64 @@ impl Widget for Battery {
         if !what.is_empty() {
             side.push(ui::label(what).tone(Tone::Dim));
         }
-        let hero = ui::row([
-            ui::display(ui::counter(percent.into(), 0..=100, "%")),
-            ui::fill(),
-            ui::column(side),
-        ])
-        .tone(self.tone());
-        let mut meter = ui::meter(f32::from(percent) / 100.0).tone(self.tone());
-        if let Some(limit) = reading.charge_limit {
-            meter = meter.limit(f32::from(limit) / 100.0);
+        // Only ebb's simulated futures give a range worth reading.
+        if let Some(estimate) = estimate
+            && self.left().is_some()
+            && estimate.method == Method::Habits
+            && estimate.high - estimate.low >= 10 * 60
+        {
+            let range = format!("likely {}", span(estimate.low, estimate.high));
+            side.push(ui::label(range).tone(Tone::Dim));
         }
+        side
+    }
 
+    /// What draws the power, since the popover opened.
+    fn apps(&self) -> Node<Message> {
+        let Some(apps) = &self.apps else {
+            return ui::label("Measuring…").tone(Tone::Dim);
+        };
+        let mut parts = Vec::new();
+        if apps.trained && apps.total > 0.05 {
+            parts.push(ui::detail("Drawing", ui::label(watts(apps.total))));
+        }
+        if apps.lines.is_empty() {
+            parts.push(ui::label("Nothing busy").tone(Tone::Dim));
+        }
+        let rows = apps.lines.iter().map(|line| {
+            let (name, icon) = if line.system {
+                (
+                    apps::system_name(&line.name),
+                    ui::icon(system_icon(&line.name)),
+                )
+            } else {
+                (line.name.clone(), ui::app_icon(line.name.clone()))
+            };
+            let value = if apps.trained {
+                watts(line.value)
+            } else {
+                format!("{:.0}% CPU", line.value * 100.0)
+            };
+            ui::list_item(name)
+                .leading(icon)
+                .trailing(ui::label(value).tone(Tone::Dim))
+        });
+        parts.push(ui::list(rows));
+        if let Some(seconds) = apps.learning {
+            parts.push(
+                ui::label(format!(
+                    "Watts per program after {} more on battery",
+                    duration(seconds as i64)
+                ))
+                .tone(Tone::Dim),
+            );
+        }
+        ui::column(parts)
+    }
+
+    fn power(&self) -> Vec<Node<Message>> {
+        let reading = &self.reading;
+        let forecast = reading.forecast.as_ref();
         let mut power = Vec::new();
         let plugged = reading.ac_online.unwrap_or(matches!(
             reading.state,
@@ -237,8 +391,10 @@ impl Widget for Battery {
                 State::Charging => "Charging at",
                 _ => "Drawing",
             };
-            let watts = ui::label(format!("{:.1} W", reading.energy_rate));
-            power.push(ui::detail(direction, watts));
+            power.push(ui::detail(direction, ui::label(watts(reading.energy_rate))));
+        }
+        if plugged && let Some(charger) = forecast.and_then(|f| f.charger) {
+            power.push(ui::detail("Charger", ui::label(format!("{charger} W"))));
         }
         if let (Some(energy), Some(full)) = (reading.energy, reading.energy_full) {
             power.push(ui::detail(
@@ -246,10 +402,42 @@ impl Widget for Battery {
                 of(format!("{energy:.1}"), format!("of {full:.1} Wh")),
             ));
         }
-        if let Some(limit) = limit {
-            power.push(ui::detail("Charge limit", ui::label(limit)));
+        if let Some(limit) = reading.charge_limit {
+            power.push(ui::detail("Charge limit", ui::label(format!("{limit}%"))));
         }
+        let Some(forecast) = forecast else {
+            return power;
+        };
+        if let Some(asleep) = forecast.asleep {
+            power.push(ui::detail(
+                "Asleep",
+                ui::label(format!("{asleep:.1}% an hour")),
+            ));
+        }
+        if let Some(estimate) = &forecast.estimate
+            && self.left().is_some()
+        {
+            let method = match estimate.method {
+                Method::Habits => "From your habits",
+                Method::Load => "From the recent load",
+                Method::Gauge => "From the power now",
+            };
+            power.push(ui::detail("Estimate", ui::label(method)));
+            if let Some(kernel) = forecast.kernel {
+                power.push(ui::detail(
+                    "Kernel's estimate",
+                    ui::label(duration(kernel)).tone(Tone::Dim),
+                ));
+            }
+        }
+        if let Some(why) = &forecast.why {
+            power.push(ui::label(capitalized(why)).tone(Tone::Dim));
+        }
+        power
+    }
 
+    fn health(&self) -> Vec<Node<Message>> {
+        let reading = &self.reading;
         let mut health = Vec::new();
         if let Some(fraction) = reading.health {
             let capacity = format!("{:.0}%", fraction * 100.0);
@@ -275,13 +463,49 @@ impl Widget for Battery {
                 ui::label(condition.clone()).tone(tone),
             ));
         }
-        let details = if health.is_empty() {
-            ui::column(power)
-        } else {
-            ui::tabs([("Power", ui::column(power)), ("Health", ui::column(health))])
-        };
-        Some(Panel::new(ui::column([hero, meter, details])))
+        health
     }
+}
+
+/// What you seem to be doing, and for how long, as ebb sees it.
+fn now(activity: &learned::Activity) -> Node<Message> {
+    let icon = match &activity.program {
+        Some(program) => ui::app_icon(program.clone()),
+        None => ui::icon(Icon::Info),
+    };
+    let since = match activity.usual {
+        Some(usual) if usual > 0 => format!(
+            "{} in, usually {}",
+            duration(activity.minutes * 60),
+            duration(usual * 60)
+        ),
+        _ => format!("{} in", duration(activity.minutes * 60)),
+    };
+    ui::list([ui::list_item(activity.label.clone())
+        .subtitle(since)
+        .leading(icon)])
+}
+
+/// An icon for a line that isn't a program.
+fn system_icon(name: &str) -> Icon {
+    match name {
+        "[display]" | "[gpu]" => Icon::Display,
+        "[wakeups]" => Icon::Bell { muted: false },
+        "[unexplained]" => Icon::Info,
+        _ => Icon::Power,
+    }
+}
+
+fn watts(watts: f64) -> String {
+    format!("{watts:.1} W")
+}
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 /// A value and, dimmed after it, what it's out of: `36.5 of 57.8 Wh`.
@@ -358,9 +582,9 @@ impl Battery {
                 return Task::batch([low, send]);
             }
             Alert::Low(percent) => {
-                let left = match self.reading.time_to_empty {
-                    0 => String::new(),
-                    seconds => format!(", about {}", duration(seconds)),
+                let left = match self.left_to(false) {
+                    None => String::new(),
+                    Some(seconds) => format!(", about {}", duration(seconds)),
                 };
                 notify::Note {
                     icon: "battery-caution",
@@ -402,9 +626,9 @@ impl Battery {
             State::Full => ("Plugged in", format!("{percent}%, charged.")),
             State::NotCharging => ("Plugged in", format!("{percent}%, not charging.")),
             // Just in, the battery may still read discharging: it's about to charge.
-            _ => match self.reading.time_to_full {
-                0 => ("Charging", format!("{percent}%")),
-                seconds => (
+            _ => match self.left_to(true) {
+                None => ("Charging", format!("{percent}%")),
+                Some(seconds) => (
                     "Charging",
                     format!("{percent}%, full in about {}.", duration(seconds)),
                 ),
@@ -419,6 +643,33 @@ impl Battery {
             // Plugged in again while the last one shows: it takes its place.
             replaces: self.plugged.unwrap_or(0),
         }
+    }
+
+    /// Seconds left until empty, or until full while charging: ebb's estimate when it has one,
+    /// the kernel's otherwise. None when there's none, or no direction to go.
+    fn left(&self) -> Option<i64> {
+        match self.reading.state {
+            State::Charging => self.left_to(true),
+            State::Discharging => self.left_to(false),
+            _ => None,
+        }
+    }
+
+    /// Seconds until full (`full`) or empty.
+    fn left_to(&self, full: bool) -> Option<i64> {
+        let reading = &self.reading;
+        let learned = reading
+            .forecast
+            .as_ref()
+            .and_then(|forecast| forecast.estimate.as_ref())
+            .filter(|estimate| estimate.to_full == full && !estimate.beyond && estimate.median > 0)
+            .map(|estimate| estimate.median);
+        let kernel = if full {
+            reading.time_to_full
+        } else {
+            reading.time_to_empty
+        };
+        learned.or((kernel > 0).then_some(kernel))
     }
 
     fn charging(&self) -> bool {
@@ -464,6 +715,19 @@ fn close(id: u32) -> Task<Message> {
         }
     })
     .discard()
+}
+
+/// `3 h 02 – 4 h 25`, or `40–55 min` under an hour.
+fn span(low: i64, high: i64) -> String {
+    let (low, high) = ((low + 30) / 60, (high + 30) / 60);
+    if high < 60 {
+        return format!("{low}–{high} min");
+    }
+    let part = |minutes: i64| match minutes / 60 {
+        0 => format!("{minutes} min"),
+        hours => format!("{hours} h {:02}", minutes % 60),
+    };
+    format!("{} – {}", part(low), part(high))
 }
 
 /// `2 h 05 min`, or `14 min` under an hour.
@@ -689,6 +953,44 @@ mod tests {
     fn formats_durations() {
         assert_eq!(duration(885), "15 min");
         assert_eq!(duration(7500), "2 h 05 min");
+        assert_eq!(span(2400, 3300), "40–55 min");
+        assert_eq!(span(10_920, 15_900), "3 h 02 – 4 h 25");
+        assert_eq!(span(2700, 4500), "45 min – 1 h 15");
+    }
+
+    fn learned(to_full: bool, median: i64, beyond: bool) -> Box<Forecast> {
+        Box::new(Forecast {
+            estimate: Some(learned::Estimate {
+                to_full,
+                median,
+                low: median,
+                high: median,
+                beyond,
+                method: Method::Habits,
+            }),
+            kernel: None,
+            activity: None,
+            asleep: None,
+            charger: None,
+            why: None,
+        })
+    }
+
+    #[test]
+    fn time_left_is_ebbs_then_the_kernels() {
+        let mut widget = battery(62.0, State::Discharging);
+        assert_eq!(widget.left(), None);
+        widget.reading.time_to_empty = 3600;
+        assert_eq!(widget.left(), Some(3600));
+        widget.reading.forecast = Some(learned(false, 7200, false));
+        assert_eq!(widget.left(), Some(7200));
+        // Past what ebb looks at, or the other way: the kernel's.
+        widget.reading.forecast = Some(learned(false, 7200, true));
+        assert_eq!(widget.left(), Some(3600));
+        widget.reading.forecast = Some(learned(true, 7200, false));
+        assert_eq!(widget.left(), Some(3600));
+        widget.reading.state = State::Full;
+        assert_eq!(widget.left(), None);
     }
 
     #[test]

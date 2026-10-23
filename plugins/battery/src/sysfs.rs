@@ -15,6 +15,7 @@ use rustix::fd::OwnedFd;
 use rustix::net::{self, AddressFamily, SocketType, netlink};
 use tokio::sync::watch as channel;
 
+use crate::learned::Forecaster;
 use crate::{Reading, State};
 
 const ROOT: &str = "/sys/class/power_supply";
@@ -47,12 +48,14 @@ fn readings() -> &'static channel::Sender<Reading> {
 }
 
 fn listen(readings: &channel::Sender<Reading>) {
+    let mut forecaster = Forecaster::new();
     let socket = uevents()
         .inspect_err(|error| eprintln!("eave-battery: uevent socket: {error}, polling only"))
         .ok();
     let mut buffer = vec![0u8; 8192];
     loop {
-        let reading = read(Path::new(ROOT));
+        let mut reading = read(Path::new(ROOT));
+        reading.forecast = forecaster.forecast(&reading).map(Box::new);
         // Without a battery there's nothing to refresh; a new one arrives as a uevent.
         let refresh = (reading.present || socket.is_none()).then_some(REFRESH);
         readings.send_if_modified(|current| {
@@ -286,6 +289,7 @@ fn combine(supplies: &[Supply]) -> Reading {
         |field: fn(&Supply) -> Option<String>| rest.is_empty().then(|| field(first)).flatten();
     Reading {
         present: true,
+        batteries: supplies.len(),
         percentage: percentage.clamp(0.0, 100.0),
         state,
         time_to_empty,
@@ -302,6 +306,7 @@ fn combine(supplies: &[Supply]) -> Reading {
         condition: one(|s| s.health.clone()),
         charge_limit: supplies.iter().filter_map(|s| s.charge_limit).min(),
         ac_online: None,
+        forecast: None,
     }
 }
 

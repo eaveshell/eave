@@ -1,7 +1,7 @@
 [package]
 name = "eave-battery"
 version = "0.1.0"
-description = "Battery level, with time left and power draw in the popover, for eave"
+description = "Battery level, with time left, power draw and what draws it in the popover, for eave"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,6 +16,13 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rustix = { version = "1", default-features = false, features = ["std", "net", "fs"] }
 tokio = { version = "1", default-features = false, features = ["sync"] }
 serde.workspace = true
+# Time left learned from how the machine is used, with a range, and power per program, when ebb's
+# collector has a recording; the kernel's estimate otherwise (D-134). Brings SQLite (bundled).
+ebb = { package = "ebb-battery", version = "0.2" }
+ebb-core = "0.2"
+ebb-platform = "0.2"
+# malloc_trim, after a forecast (D-134). Already in the tree.
+libc = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 toml.workspace = true
