@@ -260,8 +260,7 @@ where
                 {
                     Ok(Ok(snapshot)) => {
                         state.retry = RETRY;
-                        *shared.watched.lock().unwrap_or_else(|p| p.into_inner()) =
-                            snapshot.watch;
+                        *shared.watched.lock().unwrap_or_else(|p| p.into_inner()) = snapshot.watch;
                         if state.last.as_ref() != Some(&snapshot.state) {
                             state.last = Some(snapshot.state.clone());
                             return Some((snapshot.state, state));
@@ -570,13 +569,7 @@ mod tests {
     }
 
     async fn ping(client: &Connection) -> bool {
-        let ping = client.call_method(
-            None::<()>,
-            "/eave/test",
-            Some("eave.Test"),
-            "Ping",
-            &(),
-        );
+        let ping = client.call_method(None::<()>, "/eave/test", Some("eave.Test"), "Ping", &());
         tokio::time::timeout(Duration::from_secs(2), ping)
             .await
             .is_ok_and(|reply| reply.is_ok())

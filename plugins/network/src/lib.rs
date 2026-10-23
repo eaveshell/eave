@@ -496,8 +496,8 @@ impl Network {
             lines.push(ui::label(problem.clone()).tone(Tone::Critical));
         }
         // A join that failed, or one that doesn't end: the device may be stuck.
-        let stuck = self.failed.is_some()
-            || (station.state == Link::Connecting && self.joining.is_none());
+        let stuck =
+            self.failed.is_some() || (station.state == Link::Connecting && self.joining.is_none());
         if station.powered && stuck {
             lines.push(ui::row([
                 ui::label("Not joining?").tone(Tone::Dim),
@@ -1023,7 +1023,10 @@ mod tests {
         assert!(!network.busy);
         assert_eq!(network.problem.as_deref(), Some("Wi-Fi didn't respond"));
         network.update(Message::Power(false));
-        assert_eq!(network.problem, None, "a new command clears the old problem");
+        assert_eq!(
+            network.problem, None,
+            "a new command clears the old problem"
+        );
     }
 
     #[test]

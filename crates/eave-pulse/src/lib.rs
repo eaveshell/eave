@@ -46,6 +46,11 @@ pub struct Device {
     /// `index`: `alsa_output.pci-0000_00_1f.3.analog-stereo`, `bluez_output.AC_12_34_56_78_9A.1`
     /// for a Bluetooth device, with its address. What `volume`'s bays are about (D-109).
     pub name: String,
+    /// How many of its ports say something is plugged in: headphones in a jack, say. Rises when
+    /// one is plugged in, even though the device was there all along.
+    pub plugged: u8,
+    /// Hardware (ALSA, Bluetooth, USB), not a virtual device an app made, like an equalizer's.
+    pub hardware: bool,
     channels: u8,
 }
 
@@ -94,6 +99,8 @@ pub fn test_device(volume: u32) -> Device {
         form: Form::Speaker,
         connection: None,
         name: "speakers".into(),
+        plugged: 0,
+        hardware: true,
         channels: 2,
     }
 }
@@ -329,6 +336,14 @@ fn connection(
     }
 }
 
+/// Whether a device is hardware: a sound card's, a Bluetooth or USB device's. Virtual ones (an
+/// equalizer's, a combined or null sink) name no bus and aren't ALSA's or BlueZ's.
+fn hardware(name: &str, props: &protocol::Props) -> bool {
+    name.starts_with("alsa_")
+        || name.starts_with("bluez_")
+        || text(props.get(protocol::Prop::DeviceBus)).is_some()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn device(
     index: u32,
@@ -338,18 +353,26 @@ fn device(
     volume: &ChannelVolume,
     muted: bool,
     port: Option<&protocol::port_info::PortInfo>,
+    ports: &[protocol::port_info::PortInfo],
     props: &protocol::Props,
 ) -> Device {
     let channels = volume.channels();
+    let name = lossy(name);
+    let plugged = ports
+        .iter()
+        .filter(|port| port.available == protocol::port_info::PortAvailable::Yes)
+        .count();
     Device {
         index,
         direction,
-        description: lossy(description.unwrap_or(name)),
+        description: description.map_or_else(|| name.clone(), lossy),
         volume: percent(channels),
         muted,
         form: form(port, props, direction),
         connection: connection(port, props),
-        name: lossy(name),
+        hardware: hardware(&name, props),
+        name,
+        plugged: plugged.min(u8::MAX.into()) as u8,
         channels: channels.len() as u8,
     }
 }
@@ -370,6 +393,7 @@ fn read_audio(
                 &sink.cvolume,
                 sink.muted,
                 sink.ports.get(sink.active_port),
+                &sink.ports,
                 &sink.props,
             )
         })
@@ -386,6 +410,7 @@ fn read_audio(
                 &source.cvolume,
                 source.muted,
                 source.ports.get(source.active_port),
+                &source.ports,
                 &source.props,
             )
         })
@@ -553,6 +578,10 @@ fn change(facility: protocol::SubscriptionEventFacility) -> Change {
             streams: true,
         },
         // A stream follows its sink, and a new default moves streams along.
+        Facility::Card => Change {
+            devices: true,
+            streams: false,
+        },
         Facility::Sink | Facility::Source | Facility::Server => Change {
             devices: true,
             streams: facility != Facility::Source,
@@ -564,7 +593,8 @@ fn change(facility: protocol::SubscriptionEventFacility) -> Change {
 fn subscribe() -> io::Result<(Socket, u16)> {
     let (mut socket, version) = connect()?;
     use protocol::SubscriptionMask as Mask;
-    let mask = Mask::SINK | Mask::SOURCE | Mask::SINK_INPUT | Mask::SERVER;
+    // Cards for jacks: plugging headphones in changes the card's ports.
+    let mask = Mask::SINK | Mask::SOURCE | Mask::SINK_INPUT | Mask::SERVER | Mask::CARD;
     ack(&mut socket, version, 2, Command::Subscribe(mask))?;
     Ok((socket, version))
 }

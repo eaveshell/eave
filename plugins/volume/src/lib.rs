@@ -5,8 +5,11 @@
 //! item shows the percent for a moment instead of the icon. Muting nudges it down and shows the
 //! struck speaker; unmuting nudges it up and shows the percent it came back to. It shows the
 //! percent while hovered, too.
+//!
+//! A device that arrives (Bluetooth headphones connecting, a USB headset, headphones plugged into
+//! a jack) becomes the default output, or input, at once, unless `follow_new = false`.
 
-use eave_api::time::{Duration, sleep};
+use eave_api::time::{Duration, Instant, sleep};
 use eave_api::ui::{self, Action, Icon, Item, Panel, Tone};
 use eave_api::{Effect, Nudge, Registry, Subscription, Task, Widget};
 use eave_pulse::{Audio, Device, Direction, Form, Playback};
@@ -26,11 +29,91 @@ pub struct Config {
     step: u32,
     /// Highest percent eave will set. Above 100 amplifies, and can distort.
     max: u32,
+    /// Switch to a device as it arrives: connected, plugged in, or plugged into its jack.
+    follow_new: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { step: 5, max: 100 }
+        Self {
+            step: 5,
+            max: 100,
+            follow_new: true,
+        }
+    }
+}
+
+/// How long a device that left still counts as there: a Bluetooth device switching profiles,
+/// or a USB one re-enumerating, leaves and comes back, and shouldn't be followed for it.
+const COMEBACK: Duration = Duration::from_secs(5);
+
+/// A device's name without the profile number a Bluetooth sink ends with
+/// (`bluez_output.AC_12_34_56_78_9A.1`): the same headphones under another profile are the same
+/// device.
+fn identity(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((device, profile))
+            if name.starts_with("bluez_") && profile.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            device
+        }
+        _ => name,
+    }
+}
+
+/// The devices of one direction last seen, to tell one that just arrived from one that was there.
+#[derive(Debug, Default)]
+struct Seen {
+    /// The first reading came: everything there then was already there.
+    started: bool,
+    /// Each device's name, and how many of its ports had something plugged in.
+    devices: Vec<(String, u8)>,
+    /// Devices that left, and when.
+    gone: Vec<(String, Instant)>,
+    /// The device followed by plugging it into its jack, and the default before it: unplugged,
+    /// it goes back. (One that leaves, the server replaces on its own.)
+    back: Option<(String, String)>,
+}
+
+impl Seen {
+    /// The one device in `devices` that just arrived, by index, if exactly one did. Virtual
+    /// devices and displays don't count: a monitor waking up isn't a choice to listen there.
+    fn arrived(&mut self, devices: &[Device], now: Instant) -> Option<usize> {
+        self.gone
+            .retain(|(_, when)| now.saturating_duration_since(*when) < COMEBACK);
+        let before = std::mem::replace(
+            &mut self.devices,
+            devices
+                .iter()
+                .map(|device| (device.name.clone(), device.plugged))
+                .collect(),
+        );
+        for (name, _) in &before {
+            if !self.devices.iter().any(|(now, _)| now == name) {
+                self.gone.push((name.clone(), now));
+            }
+        }
+        // The first reading, or the server coming back: nothing arrived, it was all there.
+        if !std::mem::replace(&mut self.started, true) || before.is_empty() {
+            return None;
+        }
+        let mut arrived = devices.iter().enumerate().filter(|(_, device)| {
+            let followable = device.hardware
+                && device.form != Form::Display
+                && device.connection != Some("HDMI");
+            let new = match before.iter().find(|(name, _)| *name == device.name) {
+                Some((_, plugged)) => device.plugged > *plugged,
+                None => !self
+                    .gone
+                    .iter()
+                    .any(|(name, _)| identity(name) == identity(&device.name)),
+            };
+            followable && new
+        });
+        match (arrived.next(), arrived.next()) {
+            (Some((index, _)), None) => Some(index),
+            _ => None,
+        }
     }
 }
 
@@ -50,6 +133,9 @@ pub struct Volume {
     showing_level: bool,
     /// Counts changes, so only the latest one's timer puts the icon back.
     changes: u64,
+    /// Outputs and inputs seen, to follow the ones that arrive.
+    outputs: Seen,
+    inputs: Seen,
 }
 
 /// What a slider sets.
@@ -90,6 +176,7 @@ impl Widget for Volume {
             config: Config {
                 step: config.step.max(1),
                 max: config.max.max(1),
+                follow_new: config.follow_new,
             },
             audio: Audio::default(),
             streams: Vec::new(),
@@ -98,6 +185,8 @@ impl Widget for Volume {
             heard: None,
             showing_level: false,
             changes: 0,
+            outputs: Seen::default(),
+            inputs: Seen::default(),
         };
         (volume, Task::none())
     }
@@ -508,6 +597,36 @@ impl Volume {
     /// Takes in the server's reading. A level that went up or down on the same sink nudges that
     /// way. Our own changes come back here too, one reading per step, so each nudges once.
     fn read(&mut self, mut audio: Audio) -> Effect<Message> {
+        let follow = self.follow(&mut audio, Instant::now());
+        self.heard(audio).and_task(follow)
+    }
+
+    /// Makes a device that just arrived the default, here at once and then on the server, and
+    /// goes back from one that was unplugged from its jack.
+    fn follow(&mut self, audio: &mut Audio, now: Instant) -> Task<Message> {
+        let follow_new = self.config.follow_new;
+        let outputs = follow(
+            &mut self.outputs,
+            &audio.sinks,
+            &mut audio.default_sink,
+            now,
+            follow_new,
+        );
+        let inputs = follow(
+            &mut self.inputs,
+            &audio.sources,
+            &mut audio.default_source,
+            now,
+            follow_new,
+        );
+        let switches = [outputs, inputs]
+            .into_iter()
+            .flatten()
+            .map(|device| run(async move { eave_pulse::set_default(&device).await }));
+        Task::batch(switches)
+    }
+
+    fn heard(&mut self, mut audio: Audio) -> Effect<Message> {
         // A slider still being dragged keeps the level it was dragged to: readings lag behind it.
         for direction in [Direction::Output, Direction::Input] {
             let target = match direction {
@@ -591,6 +710,47 @@ impl Volume {
     }
 }
 
+/// The device to make the default in one direction, if any: one that just arrived, or the one
+/// before a device that was unplugged from its jack. Sets `default` to it.
+fn follow(
+    seen: &mut Seen,
+    devices: &[Device],
+    default: &mut Option<usize>,
+    now: Instant,
+    follow_new: bool,
+) -> Option<Device> {
+    let arrived = seen.arrived(devices, now);
+    if !follow_new {
+        return None;
+    }
+    let position = |name: &str| devices.iter().position(|device| device.name == name);
+    let current = default.and_then(|index| devices.get(index));
+    if let Some((followed, before)) = &seen.back {
+        match position(followed) {
+            Some(index) if devices[index].plugged == 0 => {
+                let back = position(before);
+                let was_default = current.is_some_and(|current| current.name == *followed);
+                seen.back = None;
+                if let (true, Some(back)) = (was_default, back) {
+                    *default = Some(back);
+                    return Some(devices[back].clone());
+                }
+            }
+            Some(_) => {}
+            None => seen.back = None,
+        }
+    }
+    let index = arrived.filter(|index| *default != Some(*index))?;
+    seen.back = match current {
+        Some(current) if devices[index].plugged > 0 && devices[index].connection.is_none() => {
+            Some((devices[index].name.clone(), current.name.clone()))
+        }
+        _ => None,
+    };
+    *default = Some(index);
+    Some(devices[index].clone())
+}
+
 fn run(work: impl Future<Output = std::io::Result<()>> + Send + 'static) -> Task<Message> {
     Task::future(async move {
         if let Err(error) = work.await {
@@ -615,6 +775,131 @@ mod tests {
         audio.sinks.push(eave_pulse::test_device(percent));
         audio.default_sink = Some(0);
         audio
+    }
+
+    fn named(name: &str, connection: Option<&'static str>) -> Device {
+        let mut device = eave_pulse::test_device(50);
+        device.name = name.into();
+        device.connection = connection;
+        device
+    }
+
+    fn reading(sinks: Vec<Device>, default: usize) -> Audio {
+        Audio {
+            sinks,
+            default_sink: Some(default),
+            ..Audio::default()
+        }
+    }
+
+    #[test]
+    fn follows_a_device_that_arrives() {
+        let (mut volume, _) = Volume::new(Config::default());
+        let speakers = named("alsa_output.speakers", None);
+        let airpods = named("bluez_output.CC_22.1", Some("Bluetooth"));
+        volume.update(Message::Read(reading(vec![speakers.clone()], 0)));
+        assert_eq!(volume.audio.default_sink, Some(0));
+        volume.update(Message::Read(reading(vec![speakers, airpods], 0)));
+        assert_eq!(
+            volume.audio.default_sink,
+            Some(1),
+            "switched to the AirPods"
+        );
+    }
+
+    #[test]
+    fn what_was_there_at_start_isnt_followed() {
+        let (mut volume, _) = Volume::new(Config::default());
+        let both = vec![
+            named("alsa_output.speakers", None),
+            named("bluez_output.CC_22.1", Some("Bluetooth")),
+        ];
+        volume.update(Message::Read(reading(both.clone(), 0)));
+        volume.update(Message::Read(reading(both, 0)));
+        assert_eq!(volume.audio.default_sink, Some(0));
+    }
+
+    #[test]
+    fn following_can_be_turned_off() {
+        let (mut volume, _) = Volume::new(Config {
+            follow_new: false,
+            ..Config::default()
+        });
+        let speakers = named("alsa_output.speakers", None);
+        let usb = named("alsa_output.usb-headset", Some("USB"));
+        volume.update(Message::Read(reading(vec![speakers.clone()], 0)));
+        volume.update(Message::Read(reading(vec![speakers, usb], 0)));
+        assert_eq!(volume.audio.default_sink, Some(0));
+    }
+
+    #[test]
+    fn arrivals_skip_displays_virtual_devices_and_profile_flips() {
+        let start = Instant::now();
+        let later = |seconds| start + Duration::from_secs(seconds);
+        let speakers = named("alsa_output.speakers", None);
+        let mut seen = Seen::default();
+        assert_eq!(seen.arrived(std::slice::from_ref(&speakers), start), None);
+
+        let mut hdmi = named("alsa_output.hdmi", Some("HDMI"));
+        hdmi.form = Form::Display;
+        assert_eq!(seen.arrived(&[speakers.clone(), hdmi], later(1)), None);
+
+        let mut equalizer = named("easyeffects_sink", None);
+        equalizer.hardware = false;
+        assert_eq!(seen.arrived(&[speakers.clone(), equalizer], later(2)), None);
+
+        let a2dp = named("bluez_output.CC_22.1", Some("Bluetooth"));
+        assert_eq!(
+            seen.arrived(&[speakers.clone(), a2dp], later(3)),
+            Some(1),
+            "the headphones connect"
+        );
+        // A call starts: the same headphones come back under the headset profile.
+        let headset = named("bluez_output.CC_22.0", Some("Bluetooth"));
+        assert_eq!(
+            seen.arrived(std::slice::from_ref(&speakers), later(4)),
+            None
+        );
+        assert_eq!(seen.arrived(&[speakers.clone(), headset], later(5)), None);
+    }
+
+    #[test]
+    fn unplugging_goes_back() {
+        let (mut volume, _) = Volume::new(Config::default());
+        let speakers = named("alsa_output.speakers", None);
+        let mut jack = named("alsa_output.headphones", None);
+        volume.update(Message::Read(reading(
+            vec![speakers.clone(), jack.clone()],
+            0,
+        )));
+        jack.plugged = 1;
+        volume.update(Message::Read(reading(
+            vec![speakers.clone(), jack.clone()],
+            0,
+        )));
+        assert_eq!(volume.audio.default_sink, Some(1), "plugged in");
+        jack.plugged = 0;
+        volume.update(Message::Read(reading(vec![speakers, jack], 1)));
+        assert_eq!(
+            volume.audio.default_sink,
+            Some(0),
+            "unplugged: back to the speakers"
+        );
+    }
+
+    #[test]
+    fn plugging_into_a_jack_is_arriving() {
+        let start = Instant::now();
+        let mut jack = named("alsa_output.headphones", None);
+        let speakers = named("alsa_output.speakers", None);
+        let mut seen = Seen::default();
+        seen.arrived(&[speakers.clone(), jack.clone()], start);
+        jack.plugged = 1;
+        assert_eq!(
+            seen.arrived(&[speakers.clone(), jack.clone()], start),
+            Some(1)
+        );
+        assert_eq!(seen.arrived(&[speakers, jack], start), None, "once");
     }
 
     fn level(volume: &Volume) -> u32 {
