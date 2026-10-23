@@ -1,5 +1,5 @@
 //! Battery level, as a battery icon filled to the charge: green while charging, red when nearly
-//! empty. Hovering it shows the percentage and the time left instead, gulping while it charges.
+//! empty. Hovering it shows the percentage instead, gulping while it charges.
 //! Read from the kernel's `/sys/class/power_supply`, with every system battery combined into one.
 //! Hidden when there's no battery (a desktop).
 //!
@@ -219,10 +219,7 @@ impl Widget for Battery {
             charge: f32::from(percent) / 100.0,
             charging: self.charging(),
         });
-        let label = match self.left() {
-            Some(seconds) => ui::label(format!("{percent}% · {}", brief(seconds))),
-            None => ui::label(format!("{percent}%")),
-        };
+        let label = ui::label(format!("{percent}%"));
         let label = if self.charging() {
             ui::gulp(label)
         } else {
@@ -720,15 +717,6 @@ fn close(id: u32) -> Task<Message> {
     .discard()
 }
 
-/// `3h 41m`, or `14m` under an hour: short enough for the bar.
-fn brief(seconds: i64) -> String {
-    let minutes = (seconds + 30) / 60;
-    match (minutes / 60, minutes % 60) {
-        (0, minutes) => format!("{minutes}m"),
-        (hours, minutes) => format!("{hours}h {minutes:02}m"),
-    }
-}
-
 /// `3 h 02 – 4 h 25`, or `40–55 min` under an hour.
 fn span(low: i64, high: i64) -> String {
     let (low, high) = ((low + 30) / 60, (high + 30) / 60);
@@ -965,8 +953,6 @@ mod tests {
     fn formats_durations() {
         assert_eq!(duration(885), "15 min");
         assert_eq!(duration(7500), "2 h 05 min");
-        assert_eq!(brief(885), "15m");
-        assert_eq!(brief(13_260), "3h 41m");
         assert_eq!(span(2400, 3300), "40–55 min");
         assert_eq!(span(10_920, 15_900), "3 h 02 – 4 h 25");
         assert_eq!(span(2700, 4500), "45 min – 1 h 15");
@@ -1005,20 +991,6 @@ mod tests {
         assert_eq!(widget.left(), Some(3600));
         widget.reading.state = State::Full;
         assert_eq!(widget.left(), None);
-    }
-
-    #[test]
-    fn hover_says_the_time_left_when_there_is_one() {
-        let mut widget = battery(42.0, State::Discharging);
-        widget.reading.forecast = Some(learned(false, 13_260, false));
-        let content = widget.item().into_parts().content;
-        let ui::Kind::Alternate { mut options, .. } = content.unwrap().into_kind() else {
-            panic!("the icon, with the percentage on hover");
-        };
-        assert!(matches!(
-            options.pop().unwrap().into_kind(),
-            ui::Kind::Label { text, .. } if text == "42% · 3h 41m"
-        ));
     }
 
     #[test]
