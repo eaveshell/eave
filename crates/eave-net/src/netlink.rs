@@ -31,8 +31,15 @@ pub struct Requests {
 
 impl Requests {
     pub fn new(protocol: Option<Protocol>) -> io::Result<Self> {
+        let socket = open(protocol, 0)?;
+        // The kernel answers at once; a reply that never comes mustn't hold the thread.
+        net::sockopt::set_socket_timeout(
+            &socket,
+            net::sockopt::Timeout::Recv,
+            Some(std::time::Duration::from_secs(5)),
+        )?;
         Ok(Self {
-            socket: open(protocol, 0)?,
+            socket,
             sequence: 0,
             // Dump replies come in chunks of up to a page or so each; this fits any of them.
             buffer: vec![0; 32 * 1024],
