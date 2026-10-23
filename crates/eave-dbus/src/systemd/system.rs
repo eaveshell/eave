@@ -56,7 +56,7 @@ pub async fn start(unit: &str) -> zbus::Result<()> {
     Err(zbus::Error::Failure(format!("{unit}: lost the system bus")))
 }
 
-fn already_subscribed(error: &zbus::Error) -> bool {
+pub(super) fn already_subscribed(error: &zbus::Error) -> bool {
     matches!(error, zbus::Error::MethodError(name, ..)
         if name.as_str() == "org.freedesktop.systemd1.AlreadySubscribed")
 }

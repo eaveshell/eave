@@ -128,7 +128,12 @@ async fn subscribe(name: &str) -> zbus::Result<(Connection, OwnedObjectPath, Sig
         .member("PropertiesChanged")?
         .build();
     let signals = drained(MessageStream::for_match_rule(rule, &connection, Some(16)).await?);
-    manager(&connection, "Subscribe", &()).await?;
+    // Another watch on the shared connection may have subscribed already.
+    if let Err(error) = manager(&connection, "Subscribe", &()).await
+        && !system::already_subscribed(&error)
+    {
+        return Err(error);
+    }
     Ok((connection, path, signals))
 }
 
