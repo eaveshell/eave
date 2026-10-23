@@ -6,7 +6,7 @@
 //! widgets' dialogs, which come out of whatever was acted on to open them (D-90).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use eave_api::erased::{AnyMessage, DialogRequest, ErasedWidget, PopoverRequest};
@@ -93,12 +93,11 @@ pub struct Bar {
     join: Join,
     /// Whether the glass plugin draws glass behind the bar ([`glass`]).
     glass: bool,
-    /// With glass, the islands over something bright, whose ink goes darker.
-    darker_ink: HashSet<IslandId>,
+    /// With glass, how bright it is behind the bar, as last reported: each island looks where it
+    /// is in it, and its ink goes darker over something bright.
+    backdrop: Option<glass::tone::Backdrop>,
     /// The island in the middle's shape, as last drawn: the dormer's or a dialog's.
     center_shape: island::Shape,
-    /// Whether its ink goes darker, over something bright.
-    center_darker: bool,
     /// The dialog asked for, while where its top goes is looked up: whose, and where it comes
     /// out of.
     asked: Option<(u64, Origin)>,
@@ -433,9 +432,8 @@ impl Bar {
             shapes: RefCell::default(),
             join: Join::default(),
             glass: false,
-            darker_ink: HashSet::new(),
+            backdrop: None,
             center_shape: island::Shape::default(),
-            center_darker: false,
             asked: None,
             touched: None,
             warned: Vec::new(),
@@ -2102,8 +2100,7 @@ fn handle(bar: &mut Bar, message: Message) -> Task<Message> {
         Message::Glass(glass::GlassEvent::Active(active)) => {
             bar.glass = active;
             if !active {
-                bar.darker_ink.clear();
-                bar.center_darker = false;
+                bar.backdrop = None;
             }
             Task::none()
         }
@@ -2111,17 +2108,7 @@ fn handle(bar: &mut Bar, message: Message) -> Task<Message> {
             if !bar.glass {
                 return Task::none();
             }
-            let shapes = bar.shapes.borrow();
-            let darker = shapes
-                .iter()
-                .filter(|(_, shape)| shape.get().width > 0.0)
-                .filter(|(id, shape)| backdrop.darker(shape.get(), bar.darker_ink.contains(id)))
-                .map(|(id, _)| *id)
-                .collect();
-            drop(shapes);
-            bar.darker_ink = darker;
-            let center = bar.center_shape.get();
-            bar.center_darker = center.width > 0.0 && backdrop.darker(center, bar.center_darker);
+            bar.backdrop = Some(backdrop);
             Task::none()
         }
         Message::CheckFullscreen => {
@@ -2624,7 +2611,7 @@ pub fn view(bar: &Bar, window: window::Id) -> Element<'_, Message> {
         Some((
             Island::new(items)
                 .glass(glass)
-                .ink(bar.darker_ink.contains(&island))
+                .backdrop(bar.backdrop.as_ref())
                 .align(align)
                 .popover(popover)
                 .nudges(nudges)
@@ -2832,7 +2819,7 @@ fn center_view(bar: &Bar, window: window::Id) -> Element<'_, Message> {
     // Glass, once it lets go of the notch.
     let island = Island::new([(DORMER, Space::new().into())])
         .glass(bar.glass_on())
-        .ink(bar.center_darker)
+        .backdrop(bar.backdrop.as_ref())
         .shape(bar.center_shape.clone())
         .align(Horizontal::Center)
         .popover(Some(popover))
