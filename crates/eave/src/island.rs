@@ -36,7 +36,7 @@ use iced::{
 use crate::bezel::Sag;
 use crate::body::Body;
 use crate::field::AnyFocused;
-use crate::glass;
+use crate::glass::{self, tone::Backdrop};
 use crate::hand::{self, rubber_band};
 use crate::jelly::{self, Jelly, Side};
 use crate::join::{self, Join, Joining};
@@ -89,8 +89,9 @@ pub struct Island<'a, M> {
     shape: Option<Shape>,
     /// Whether it may turn to glass, with the glass plugin ([`glass`]).
     glass: bool,
-    /// Whether its ink goes darker over the glass: over something bright.
-    darker: bool,
+    /// How bright it is behind the bar, as last reported: its ink goes darker over something
+    /// bright.
+    backdrop: Option<&'a Backdrop>,
     /// The screen's edges it keeps clear of, if any (D-104).
     walls: Option<Walls>,
     /// Where a shape that joins it is, while it does ([`Popover::join`]): drawn with its own as
@@ -219,7 +220,7 @@ impl<'a, M> Island<'a, M> {
             shape: None,
             walls: None,
             glass: false,
-            darker: false,
+            backdrop: None,
             joined: None,
         }
     }
@@ -230,9 +231,11 @@ impl<'a, M> Island<'a, M> {
         self
     }
 
-    /// Its ink goes darker over the glass, rather than lighter: it turns as this changes.
-    pub fn ink(mut self, darker: bool) -> Self {
-        self.darker = darker;
+    /// How bright it is behind the bar: over something bright, its ink goes darker over the
+    /// glass, rather than lighter. It looks where it is every frame, since it moves without a new
+    /// report, and turns as that changes.
+    pub fn backdrop(mut self, backdrop: Option<&'a Backdrop>) -> Self {
+        self.backdrop = backdrop;
         self
     }
 
@@ -1857,6 +1860,18 @@ impl Motion {
         }
     }
 
+    /// Turns the ink darker over something bright behind where the shape is now, and back
+    /// lighter, or lighter with nothing reported. Until it's laid out it stays as it is.
+    fn turn_ink(&mut self, backdrop: Option<&Backdrop>) {
+        if self.island.is_none() {
+            return;
+        }
+        let darker = backdrop.is_some_and(|backdrop| {
+            backdrop.darker(self.shape() + self.offset(), self.ink.target > 0.5)
+        });
+        self.ink.target = ink_target(darker);
+    }
+
     /// The shape's frame: its edges. The skin bends what's drawn of it ([`Jelly::displace`]).
     fn shape(&self) -> Rectangle {
         self.edges.rect()
@@ -2723,10 +2738,7 @@ impl<M: Clone> Widget<M, iced::Theme, iced::Renderer> for Island<'_, M> {
 
     fn state(&self) -> tree::State {
         tree::State::new(State {
-            motion: Motion {
-                ink: Spring::new(ink_target(self.darker), FADE),
-                ..Motion::default()
-            },
+            motion: Motion::default(),
             shape: Cache::new(),
             shape_bent: Cell::new(false),
             shape_corners: Cell::new([CornerShape::SQUARE; 4]),
@@ -2913,7 +2925,7 @@ impl<M: Clone> Widget<M, iced::Theme, iced::Renderer> for Island<'_, M> {
     fn diff(&self, tree: &mut Tree) {
         tree.diff_children(&self.items);
         let state = tree.state.downcast_mut::<State>();
-        state.motion.ink.target = ink_target(self.darker);
+        state.motion.turn_ink(self.backdrop);
         let panel = &mut state.panel;
         match (&self.popover, panel.as_mut()) {
             (Some(popover), Some(tree)) => tree.diff(&popover.content),
@@ -3098,6 +3110,7 @@ impl<M: Clone> Widget<M, iced::Theme, iced::Renderer> for Island<'_, M> {
             // Every frame starts with this event.
             Event::Window(window::Event::RedrawRequested(now)) => {
                 motion.step(*now);
+                motion.turn_ink(self.backdrop);
                 // Before anything is drawn: the island it joins draws it this frame.
                 motion.publish();
             }
@@ -3466,6 +3479,35 @@ mod tests {
     }
 
     /// An island already laid out and at rest at `island`, with items `keys` at 10, 50, 90…
+    #[test]
+    fn ink_turns_as_the_island_moves_over_what_is_behind_it() {
+        // Dark behind the left half of the bar, bright behind the right, and no new report.
+        let backdrop =
+            Backdrop::new(16, 8, 2, &[[0; 4], [255; 4], [0; 4], [255; 4]].concat()).unwrap();
+        let at = |x: f32| Rectangle::new(Point::new(x, 0.0), Size::new(30.0, 30.0));
+        let mut motion = settled(at(4.0), &[]);
+        motion.turn_ink(Some(&backdrop));
+        assert_eq!(motion.ink.target, 0.0, "over the dark half");
+
+        // It slides over the bright half, as a live island does when its neighbor grows.
+        motion.arrange(at(90.0), std::iter::empty(), None);
+        run(&mut motion, Instant::now(), |_| {});
+        let mut now = Instant::now();
+        for _ in 0..1000 {
+            let moving = motion.step(now);
+            motion.turn_ink(Some(&backdrop));
+            if !moving && motion.ink.value == motion.ink.target {
+                break;
+            }
+            now += FRAME;
+        }
+        assert_eq!(motion.ink.target, 1.0, "over the bright half");
+
+        // Nothing reported turns it back.
+        motion.turn_ink(None);
+        assert_eq!(motion.ink.target, 0.0);
+    }
+
     fn settled(island: Rectangle, keys: &[u64]) -> Motion {
         let mut motion = Motion::default();
         let positions = keys
