@@ -471,7 +471,12 @@ pub async fn diagnostics(station: &Station) -> zbus::Result<Diagnostics> {
 /// A short reason an iwd call failed, fit to show under a password field.
 pub fn reason(error: &zbus::Error) -> &'static str {
     let Some(name) = error_name(error) else {
-        return "Couldn't reach iwd";
+        return match error {
+            zbus::Error::InputOutput(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                "The network didn't answer in time"
+            }
+            _ => "Couldn't reach iwd",
+        };
     };
     match name {
         "InvalidFormat" => "That password isn't valid for this network",

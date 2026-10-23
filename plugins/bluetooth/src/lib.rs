@@ -132,6 +132,18 @@ impl Widget for Bluetooth {
         match message {
             Message::Read(state) => {
                 self.state = Some(state);
+                // Connected or not as asked: done, however the call is doing. BlueZ can take
+                // long to answer a connect after the device has already come.
+                if let Some((path, busy)) = &self.busy {
+                    let done = self.device(path).is_some_and(|device| match busy {
+                        Busy::Connecting => device.connected,
+                        Busy::Disconnecting => !device.connected,
+                        Busy::Pairing => false,
+                    });
+                    if done {
+                        self.busy = None;
+                    }
+                }
                 if !self.adapter().is_some_and(|adapter| adapter.powered) {
                     self.looking = false;
                 }
