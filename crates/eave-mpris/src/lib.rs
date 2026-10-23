@@ -14,6 +14,7 @@ use eave_dbus::zbus::message::Type as MessageType;
 use eave_dbus::zbus::names::BusName;
 use eave_dbus::zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use eave_dbus::zbus::{Connection, MatchRule, MessageStream};
+use eave_dbus::{Signals, drained};
 use futures_util::{FutureExt, StreamExt, stream};
 
 pub use eave_dbus::{Stream, zbus};
@@ -120,7 +121,7 @@ impl Player {
 /// lists aren't yielded. Without a session bus the stream ends.
 pub fn watch() -> impl Stream<Item = Vec<Player>> {
     struct State {
-        signals: Option<(Connection, stream::Select<MessageStream, MessageStream>)>,
+        signals: Option<(Connection, stream::Select<Signals, Signals>)>,
         last: Option<Vec<Player>>,
         stale: bool,
     }
@@ -170,7 +171,7 @@ pub fn watch() -> impl Stream<Item = Vec<Player>> {
 
 /// Players' names coming and going, and every signal from a player's object: its property
 /// changes and `Seeked`.
-async fn subscribe() -> zbus::Result<(Connection, stream::Select<MessageStream, MessageStream>)> {
+async fn subscribe() -> zbus::Result<(Connection, stream::Select<Signals, Signals>)> {
     let connection = eave_dbus::session().await?;
     let names = MatchRule::builder()
         .msg_type(MessageType::Signal)
@@ -183,8 +184,9 @@ async fn subscribe() -> zbus::Result<(Connection, stream::Select<MessageStream, 
         .msg_type(MessageType::Signal)
         .path(PATH)?
         .build();
-    let names = MessageStream::for_match_rule(names, &connection, Some(16)).await?;
-    let players = MessageStream::for_match_rule(players, &connection, Some(64)).await?;
+    // Read as they come, even during a snapshot, so a chatty player can't stall the connection.
+    let names = drained(MessageStream::for_match_rule(names, &connection, Some(16)).await?);
+    let players = drained(MessageStream::for_match_rule(players, &connection, Some(64)).await?);
     Ok((connection, stream::select(names, players)))
 }
 

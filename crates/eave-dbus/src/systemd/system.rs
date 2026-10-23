@@ -28,7 +28,8 @@ pub async fn start(unit: &str) -> zbus::Result<()> {
         .interface(MANAGER)?
         .member("JobRemoved")?
         .build();
-    let mut signals = MessageStream::for_match_rule(rule, &connection, Some(16)).await?;
+    // Every job's end comes, and the call below can wait on a password: read them as they come.
+    let mut signals = crate::drained(MessageStream::for_match_rule(rule, &connection, Some(16)).await?);
     // The shared connection may have subscribed already, which systemd answers with an error.
     if let Err(error) = manager(&connection, "Subscribe", &()).await
         && !already_subscribed(&error)
