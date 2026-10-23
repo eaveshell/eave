@@ -282,12 +282,31 @@ pub async fn stop_discovery(adapter: &Adapter) -> zbus::Result<()> {
 }
 
 /// Connects a paired device. Answers once it's connected, or couldn't be: seconds, sometimes.
+/// Connects a device. Already connected is done; already connecting is left to finish, and
+/// its `Connected` says when it has.
 pub async fn connect(device: &Device) -> zbus::Result<()> {
-    call(&device.path, DEVICE, "Connect").await
+    match call(&device.path, DEVICE, "Connect").await {
+        Err(error) if matches!(error_name(&error), Some("AlreadyConnected" | "InProgress")) => {
+            Ok(())
+        }
+        result => result,
+    }
 }
 
+/// Disconnects a device. Already disconnected is done.
 pub async fn disconnect(device: &Device) -> zbus::Result<()> {
-    call(&device.path, DEVICE, "Disconnect").await
+    match call(&device.path, DEVICE, "Disconnect").await {
+        Err(error) if error_name(&error) == Some("NotConnected") => Ok(()),
+        result => result,
+    }
+}
+
+/// BlueZ's short name for an error, like `Failed` or `InProgress`.
+fn error_name(error: &zbus::Error) -> Option<&str> {
+    match error {
+        zbus::Error::MethodError(name, ..) => name.as_str().rsplit('.').next(),
+        _ => None,
+    }
 }
 
 /// Pairs a device, trusts it so it can connect on its own later, and connects it. BlueZ asks
@@ -323,6 +342,9 @@ pub async fn forget(adapter: &Adapter, device: &Device) -> zbus::Result<()> {
 pub fn reason(error: &zbus::Error) -> &'static str {
     let (name, message) = match error {
         zbus::Error::MethodError(name, message, ..) => (name.as_str(), message.as_deref()),
+        zbus::Error::InputOutput(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            return "The device didn't answer in time";
+        }
         _ => return "Couldn't reach Bluetooth",
     };
     match name.rsplit('.').next().unwrap_or("") {

@@ -7,7 +7,7 @@ use zbus::message::Type as MessageType;
 use zbus::zvariant::OwnedObjectPath;
 use zbus::{Connection, MatchRule, MessageStream};
 
-use crate::{Stream, properties, session};
+use crate::{Signals, Stream, drained, properties, session};
 
 pub mod system;
 
@@ -81,7 +81,7 @@ pub async fn unit(name: &str) -> zbus::Result<Unit> {
 /// or no systemd on it.
 pub fn watch(name: &'static str) -> impl Stream<Item = Unit> {
     struct State {
-        watching: Option<(Connection, OwnedObjectPath, MessageStream)>,
+        watching: Option<(Connection, OwnedObjectPath, Signals)>,
         last: Option<Unit>,
     }
 
@@ -117,7 +117,7 @@ pub fn watch(name: &'static str) -> impl Stream<Item = Unit> {
 
 /// Asks systemd for its signals, which it sends only to those who ask, and listens for `name`'s
 /// property changes.
-async fn subscribe(name: &str) -> zbus::Result<(Connection, OwnedObjectPath, MessageStream)> {
+async fn subscribe(name: &str) -> zbus::Result<(Connection, OwnedObjectPath, Signals)> {
     let connection = session().await?;
     let path = path(&connection, name).await?;
     let rule = MatchRule::builder()
@@ -127,8 +127,13 @@ async fn subscribe(name: &str) -> zbus::Result<(Connection, OwnedObjectPath, Mes
         .interface("org.freedesktop.DBus.Properties")?
         .member("PropertiesChanged")?
         .build();
-    let signals = MessageStream::for_match_rule(rule, &connection, Some(16)).await?;
-    manager(&connection, "Subscribe", &()).await?;
+    let signals = drained(MessageStream::for_match_rule(rule, &connection, Some(16)).await?);
+    // Another watch on the shared connection may have subscribed already.
+    if let Err(error) = manager(&connection, "Subscribe", &()).await
+        && !system::already_subscribed(&error)
+    {
+        return Err(error);
+    }
     Ok((connection, path, signals))
 }
 

@@ -759,7 +759,7 @@ The designs were agreed first as mockups, kept in `docs/mockups/`.
 
 ## D-42: Wi-Fi controls through iwd
 
-**Status:** accepted (2026-10-13). Amends D-23 for the network popover.
+**Status:** accepted (2026-10-13). Amends D-23 for the network popover. Watching iwd only while the popover is open, and its dormer actions reading iwd once, are superseded by [D-132](#d-132-d-bus-watches-cant-stall-the-connection-and-iwd-is-always-watched): iwd is watched all the time, and its station state overrules the kernel's route.
 
 **What:** the kernel can list networks but can't join a WPA one, so the network popover's controls go through iwd's D-Bus API, in `crates/eave-iwd` on `eave-dbus`: the list of networks with signal, security and whether they're saved; scan; connect (with a passphrase through an iwd agent eave serves); disconnect; forget; auto-join; power. The bar item and the connection details stay kernel-only (`eave-net`). Without iwd, or without permission to use it (iwd allows root and the `wheel` and `network` groups), the popover shows the kernel's details and says Wi-Fi controls need iwd.
 
@@ -3138,3 +3138,58 @@ The cause underneath: the dialog is a second solid shape, drawn by the island in
 - Only systemd-boot through logind: no setup, but no macOS on Apple Silicon and no GRUB, which is what this MacBook runs.
 
 **Cost:** no new dependency; the plugin uses eave-api, eave-dbus, eave-hyprland and serde, all in the tree. Three units and a rule to install once as root, which the AUR package does. Nothing runs until the popover opens or an action is picked: logind is asked when the plugin starts and each time the popover opens, and nothing is polled.
+
+---
+
+## D-132: D-Bus watches can't stall the connection, and iwd is always watched
+
+**Status:** accepted (2026-10-23). Supersedes part of [D-42](#d-42-wi-fi-controls-through-iwd).
+
+**What happened:** Wi-Fi and Bluetooth sometimes stopped working from the bar until it restarted. The toggles and Disconnect did nothing, popovers froze on their last state, and the network said connected when it wasn't. A reboot "fixed" it, because a reboot restarts the bar. The cause was the shared system-bus connection stalling:
+- zbus gives each `MessageStream` a queue (64 for eave-dbus's watches). When one is full, its reader waits for room before reading anything else from the socket, replies included.
+- A watch read its stream only between snapshots. While it waited on its snapshot's reply, a scan's burst of signals filled the queue, the reader stopped, and the reply never got read. Nothing had a timeout, so every call on the connection waited forever: iwd, BlueZ, logind, systemd.
+- `watch_all`'s rule named only the sender, by its well-known name (`net.connman.iwd`). zbus can't check a well-known sender itself, so every watch got every signal on the connection, BlueZ's included, and filled up all the faster.
+
+A test in `eave-dbus` reproduces it with a connection to itself: an unread stream and 200 signals, and a call is never answered.
+
+**What:**
+- **Signals are read as they come** by a task per watch (`eave_dbus::drained` for other streams). The task only marks the watch stale and wakes it; the watch debounces 50 ms and takes its snapshot. No queue fills while a snapshot runs. systemd's job watch and eave-mpris's streams read the same way.
+- **Rules name the service's unique owner**, asked with `GetNameOwner`, which zbus can match. `NameOwnerChanged` for the service is watched too: when iwd or bluetoothd restarts, the rule follows the new owner and the state is read again. When it stops, the snapshot says it's not running.
+- **Timeouts.** Calls on the shared connections time out after 75 s, longer than BlueZ waits for a pairing code (60 s). A snapshot gets 15 s. One that gets no answer means the connection is broken: it's dropped, and the watch opens a new one, retrying after 1 s and up to 30 s. The shared connections are no longer a `OnceCell`; a broken one is replaced.
+- **iwd is watched all the time** by the network widget, not only while its popover is open. An idle iwd sends nothing, so it costs no CPU. The dormer acts on what's true now ("Disconnect" from a network the bar left long ago did nothing), and the bar item takes iwd's station `State` over the kernel's route: a route that outlives its network shows offline, and joining shows as joining.
+- **eave-iwd** reads the station's `State` and `ConnectedNetwork` rather than each network's `Connected`, which can lag. Disconnect when already disconnected is done; a join replaced by another (`Aborted`) isn't a failure. The agent is registered for every join, so a saved password that stopped working asks eave, which says no, and the password page opens.
+- **The network widget** shows why a command failed, runs one command at a time, and has **Restart Wi-Fi** (popover and dormer): the device off and on. That's how this MacBook's Broadcom firmware recovers when it fails every join (`connect-failed`, scans failing with `Invalid exchange`, see [platform.md](platform.md)).
+- **eave-net** ignores default routes through links that are down, and through Wi-Fi with no network. Its thread starts again after an error instead of ending, and a netlink reply that never comes times out after 5 s.
+- **Bluetooth:** connect counts `AlreadyConnected` and `InProgress` as done, disconnect counts `NotConnected`. A device reaching the state asked for ends the wait even if BlueZ hasn't answered the call yet.
+
+**Why not:**
+- *A bigger queue:* moves the cliff, doesn't remove it. A long scan or discovery fills any size.
+- *Overflow (dropping old signals):* zbus offers it only on its own unfiltered stream, and a dropped signal could be the one that matters.
+- *Watching iwd only while open, and polling it once for the dormer (D-42):* that's what let the dormer act on stale state. Watching costs nothing while nothing happens.
+
+**Cost:** no new dependency (tokio's `rt` feature was already on in the tree). Asahi, release, tiny-skia, clock + volume + network + bluetooth: binary 21.59 → 21.72 MB, RSS ~22.5 → ~22.8 MB, idle CPU unchanged (1–4 ticks in 20 s either way), same threads.
+
+---
+
+## D-133: Sound follows a device as it arrives
+
+**Status:** accepted (2026-10-23).
+
+**What:** when a device arrives, the volume widget makes it the default output or input:
+- Bluetooth headphones connecting (their mic too, when they have one);
+- a USB headset or microphone;
+- headphones or a headset plugged into a jack: a port of a device already there turns available.
+
+Unplugged from its jack, the default goes back to what it was. A device that disconnects is left to the server, which picks another. `follow_new = false` turns it off.
+
+**How:** eave-pulse reports, per device, how many ports have something plugged in, and whether it's hardware (ALSA, BlueZ, or a bus). It listens to card events too, since jacks change cards. The widget keeps the names it last saw per direction and follows exactly one device that arrived:
+- The first reading, and the first after the server comes back, are where things were: nothing is followed.
+- Virtual devices (an equalizer, a convolver, a null sink) and displays (HDMI, DisplayPort) aren't followed: a monitor waking up isn't a choice to listen there.
+- A device that left less than 5 s ago and comes back isn't new. Bluetooth headphones switching profile for a call come back under another name (`bluez_output.<address>.0` for `.1`), and count as the same device.
+- Two arriving at once (a dock) aren't followed: which one is meant isn't clear.
+
+**Why in the bar, not the server:**
+- WirePlumber has no "switch to what was just connected": it restores the last default you picked, else the highest-priority device. pipewire-pulse's `module-switch-on-connect` does switch, but follows every new sink, virtual ones and profile flips included, needs PipeWire config the bar shouldn't own, and doesn't see a jack on a device that's already there.
+- The bar already watches every device (D-19).
+
+**Cost:** only while the bar runs. `set_default` is what choosing a device in the popover does, so WirePlumber remembers it as picked. Bluetooth mics follow too, as asked: recording from one switches the headphones to the headset profile, which sounds worse, until it stops.

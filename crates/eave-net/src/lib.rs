@@ -94,8 +94,15 @@ fn networks() -> &'static channel::Sender<Network> {
         std::thread::Builder::new()
             .name("eave-net".into())
             .spawn(move || {
-                if let Err(error) = listen(&networks) {
-                    eprintln!("eave-net: {error}");
+                // Listening only stops on an error; start again rather than leave the bar
+                // showing the last state forever.
+                let mut retry = Duration::from_secs(1);
+                loop {
+                    if let Err(error) = listen(&networks) {
+                        eprintln!("eave-net: {error}");
+                    }
+                    std::thread::sleep(retry);
+                    retry = (retry * 2).min(Duration::from_secs(30));
                 }
             })
             .expect("spawning a thread");
@@ -185,47 +192,59 @@ impl Reader {
 
     fn read(&mut self) -> io::Result<Network> {
         let links = self.links()?;
-        let routes = self.default_routes()?;
-        let Some(route) = primary(&routes) else {
-            let connecting = links.values().any(Link::is_physical_and_up);
-            let state = if connecting {
-                State::Connecting
-            } else {
-                State::Offline
+        // A route through a link that's down (a Wi-Fi that lost its network, a pulled cable)
+        // goes nowhere, even while it lingers.
+        let mut routes = self.default_routes()?;
+        routes.retain(|route| links.get(&route.interface).is_some_and(|link| link.up));
+        loop {
+            let Some(route) = primary(&routes).cloned() else {
+                let connecting = links.values().any(Link::is_physical_and_up);
+                let state = if connecting {
+                    State::Connecting
+                } else {
+                    State::Offline
+                };
+                return Ok(Network {
+                    state,
+                    primary: None,
+                });
             };
+            let link = links.get(&route.interface);
+
+            let kind = match self
+                .wifi
+                .as_mut()
+                .map(|wifi| wifi.association(route.interface))
+            {
+                Some(Ok(Some(association))) => match association.ssid {
+                    Some(ssid) => Kind::Wifi {
+                        ssid,
+                        strength: association.signal.map_or(0, strength),
+                        frequency: association.frequency,
+                    },
+                    // Wi-Fi that isn't on a network: its route goes nowhere.
+                    None => {
+                        routes.retain(|other| other.interface != route.interface);
+                        continue;
+                    }
+                },
+                Some(Err(error)) => {
+                    eprintln!("eave-net: nl80211: {error}");
+                    Kind::Other
+                }
+                _ => link.map_or(Kind::Other, Link::kind),
+            };
+
             return Ok(Network {
-                state,
-                primary: None,
+                state: State::Online,
+                primary: Some(Connection {
+                    interface: link.map(|link| link.name.clone()).unwrap_or_default(),
+                    kind,
+                    address: self.address(route.interface)?,
+                    gateway: route.gateway.map(|gateway| gateway.to_string()),
+                }),
             });
-        };
-        let link = links.get(&route.interface);
-
-        let kind = match self
-            .wifi
-            .as_mut()
-            .map(|wifi| wifi.association(route.interface))
-        {
-            Some(Ok(Some(association))) => Kind::Wifi {
-                ssid: association.ssid.unwrap_or_default(),
-                strength: association.signal.map_or(0, strength),
-                frequency: association.frequency,
-            },
-            Some(Err(error)) => {
-                eprintln!("eave-net: nl80211: {error}");
-                Kind::Other
-            }
-            _ => link.map_or(Kind::Other, Link::kind),
-        };
-
-        Ok(Network {
-            state: State::Online,
-            primary: Some(Connection {
-                interface: link.map(|link| link.name.clone()).unwrap_or_default(),
-                kind,
-                address: self.address(route.interface)?,
-                gateway: route.gateway.map(|gateway| gateway.to_string()),
-            }),
-        })
+        }
     }
 
     fn links(&mut self) -> io::Result<HashMap<u32, Link>> {

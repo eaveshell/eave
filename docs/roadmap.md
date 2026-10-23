@@ -36,6 +36,7 @@ The order follows two ideas: **prove the hardest property early** (smooth animat
 
 - [x] **6.10 Bays and parts.** A widget can show inside another's popover, where it leaves room: Spotify's playlists in `media`, a headset's battery in `volume`. The user decides, in config.toml, whether a widget sits on its own or in another's bay ([D-109](decisions.md)).
 - [x] **6.11 Power.** `plugins/power`: lock, log out, suspend, hibernate, reboot and shut down through logind, and reboot into another system: systemd-boot entries through logind, macOS on Apple Silicon, GRUB and firmware entries through small boot helper units ([D-131](decisions.md)).
+- [x] **6.12 Solid radios, sound that follows.** D-Bus watches that can't stall the connection, iwd watched all the time with its station state trusted, errors shown, Restart Wi-Fi; Bluetooth settling on BlueZ's state ([D-132](decisions.md)). New audio devices, Bluetooth, USB or a jack, become the default ([D-133](decisions.md)).
 
 ## Next
 

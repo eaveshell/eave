@@ -10,4 +10,9 @@ repository.workspace = true
 # Pure Rust, async (D-7). tokio instead of the default async-io executor, which would be a second runtime.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-tokio = { version = "1", default-features = false, features = ["sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+# A connection to ourselves, for testing what a full queue does.
+zbus = { version = "5", default-features = false, features = ["tokio", "p2p"] }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
