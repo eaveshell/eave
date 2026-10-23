@@ -201,6 +201,7 @@ It checks what the bar depends on and says what's wrong, and what to do about it
 - Hyprland loads hypr-eave, and the one eave-build installed last, not an older copy ([D-113](decisions.md)). It's optional: a warning only when it's built and not loaded, or the glass theme needs it.
 - Hyprland doesn't animate the bar's size: its `layersIn` animation is off (see [Hyprland's layer animation](#hyprlands-layer-animation)).
 - `eave.service` and `eave-rebuild.path` are enabled, systemd knows `WAYLAND_DISPLAY` and `HYPRLAND_INSTANCE_SIGNATURE`, and the update units are installed. Asked over D-Bus, and skipped without a systemd user manager.
+- With a battery widget on a machine with a battery: ebb's collector (`ebb-collector.service`) is enabled, so the time left is learned rather than the kernel's guess. A warning, with how to install it, when it isn't ([D-134](decisions.md)).
 
 It doesn't need the bar, so it helps most when the bar won't start. It exits with 1 when it found a problem. Run it with the binary the bar runs, `~/.local/bin/eave doctor`: it checks the widgets that binary has. `--report <path>` also writes what it found as TOML. The `essential` widget's Check health, in the dormer, runs it that way and shows the report in a dialog.
 

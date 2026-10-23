@@ -1,5 +1,5 @@
 # Plugin manifest, beside the crate's Cargo.toml.
 [plugin]
 name = "battery"
-description = "Battery level, with time left and power draw in the popover (from the kernel, no daemon needed)"
+description = "Battery level, with time left, power draw and what draws it in the popover (learned by ebb when it records, from the kernel otherwise)"
 api = "0.1"

@@ -1,6 +1,6 @@
 //! `eave doctor` (D-96): checks what the bar depends on and says what's wrong, and what to do
 //! about it. config.toml, the widgets it names, their keys, the screen, hypr-eave, Hyprland's
-//! layer animation, and the systemd units.
+//! layer animation, the systemd units, and ebb for the battery widget.
 //! Runs without a bar, so it helps most when the bar won't start. The `essential` plugin's Check
 //! health runs it with `--report` and shows what it wrote.
 
@@ -56,9 +56,13 @@ async fn checks(registry: &Registry) -> Vec<Check> {
     let mut checks = Vec::new();
     let path = config::dir().map(|dir| dir.join(config::FILE));
     let config = config_checks(path.as_deref(), &mut checks);
+    let mut battery = false;
     if let Some(config) = &config {
         let widgets = widget_checks(config, registry, &mut checks);
         checks.extend(key_checks(&widgets));
+        battery = widgets
+            .iter()
+            .any(|(entry, _)| config::widget_name(&entry.widget) == "battery");
     }
     let screens = config.as_ref().map(Config::screens).unwrap_or_default();
     let monitor = notch::focused().await;
@@ -78,7 +82,52 @@ async fn checks(registry: &Registry) -> Vec<Check> {
         }
     }
     checks.extend(systemd_checks().await);
+    if battery && has_battery(Path::new(POWER_SUPPLY)) {
+        let collector = eave_dbus::systemd::file_state(EBB_COLLECTOR).await.ok();
+        checks.push(ebb_check(collector.as_deref()));
+    }
     checks
+}
+
+const POWER_SUPPLY: &str = "/sys/class/power_supply";
+/// The unit that runs ebb's collector, which the battery widget reads its forecasts from (D-134).
+const EBB_COLLECTOR: &str = "ebb-collector.service";
+
+/// Whether the machine has a battery of its own: not a mouse's (`scope = Device`).
+fn has_battery(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let text = |name: &str| std::fs::read_to_string(entry.path().join(name)).ok();
+        text("type").is_some_and(|kind| kind.trim() == "Battery")
+            && text("scope").is_none_or(|scope| scope.trim() != "Device")
+    })
+}
+
+/// Whether ebb records the machine, so the battery widget can say a time left learned from use
+/// rather than the kernel's guess. `state` is its collector unit's, `None` when it isn't there.
+fn ebb_check(state: Option<&str>) -> Check {
+    let install = "Install it with cargo install ebb-cli --locked, then add its collector unit and \
+                   enable it: https://github.com/francescomengarelli/ebb#install";
+    match state {
+        Some("enabled") => Check::good(
+            "ebb learns the battery",
+            "The battery widget's time left comes from it, with a range, and its popover says \
+             what draws the power.",
+        ),
+        Some(state) => Check::warning(
+            format!("ebb's collector is {state}, so ebb stops learning the battery"),
+            "systemctl --user enable --now ebb-collector",
+        ),
+        None => Check::warning(
+            "ebb isn't installed, so the battery's time left is the kernel's guess",
+            format!(
+                "ebb learns what this machine costs to run and how you use it, for a steadier \
+                 time left with a range, and what draws the power. {install}"
+            ),
+        ),
+    }
 }
 
 /// Whether config.toml is there and reads, and what it warns about. The config, when it reads.
@@ -678,5 +727,30 @@ mod tests {
             missing_environment(&[]),
             ["WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE"]
         );
+    }
+
+    #[test]
+    fn ebb_says_how_to_get_it() {
+        assert_eq!(ebb_check(Some("enabled")).level, Level::Good);
+        assert_eq!(ebb_check(Some("disabled")).level, Level::Warning);
+        let missing = ebb_check(None);
+        assert_eq!(missing.level, Level::Warning);
+        assert!(missing.detail.contains("cargo install ebb-cli"));
+    }
+
+    #[test]
+    fn a_mouse_is_not_a_battery() {
+        let root = std::env::temp_dir().join(format!("eave-doctor-power-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mouse = root.join("hidpp_battery_0");
+        std::fs::create_dir_all(&mouse).unwrap();
+        std::fs::write(mouse.join("type"), "Battery\n").unwrap();
+        std::fs::write(mouse.join("scope"), "Device\n").unwrap();
+        assert!(!has_battery(&root));
+        let own = root.join("BAT0");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("type"), "Battery\n").unwrap();
+        assert!(has_battery(&root));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
