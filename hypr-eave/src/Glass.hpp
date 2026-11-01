@@ -28,6 +28,9 @@
 #include "eave-glass-v1.hpp"
 
 class CWLSurfaceResource;
+namespace Render {
+    class CRenderContext;
+}
 
 namespace Glass {
     using Clock = std::chrono::steady_clock;
@@ -152,8 +155,8 @@ namespace Glass {
     void stopProtocol(); // unloading: tells every client, removes the global, keeps the rest inert
 
     // Render.cpp
-    void onRenderBegin();
-    void wrapLayers();
+    void onRenderBegin(Render::CRenderContext& ctx);
+    void wrapLayers(Render::CRenderContext& ctx);
     void freeRender();      // GL objects and buffers; the EGL context must be current
     void forgetMonitor(void* monitor);
     std::string buffers(); // for `hyprctl hypreave`
@@ -209,7 +212,7 @@ namespace Glass {
 
     // Cursor.cpp: the pointer under the notch and the grown edge.
     bool cursorUnder();              // the config allows it
-    void tuckCursor();               // at RENDER_LAST_MOMENT, after wrapLayers
+    void tuckCursor(Render::CRenderContext& ctx); // at RENDER_LAST_MOMENT, after wrapLayers
     void updateCursorLocks(std::optional<Vector2D> at = std::nullopt); // a software cursor only near them
     void forgetCursorMonitor(void* monitor);
     void releaseCursorLocks();       // unloading

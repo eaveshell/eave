@@ -10,6 +10,7 @@
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/config/values/types/BoolValue.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
+#include <hyprland/src/ipc/s1/S1.hpp>
 
 using namespace Render::GL;
 
@@ -20,7 +21,7 @@ namespace Glass {
 
     static struct {
         CHyprSignalListener               stage, monitorRemoved, configReloaded, mouseMove;
-        SP<SHyprCtlCommand>               command;
+        SP<IPC::Socket1::SCommand>        command;
         SP<Config::Values::CBoolValue>    enabled, cursorUnder;
         bool                              failed = false;
         std::string                       why;
@@ -104,17 +105,21 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     startProtocol();
 
-    g_state.stage = Event::bus()->m_events.render.stage.listen([](eRenderStage stage) {
+    g_state.stage = Event::bus()->m_events.render.stage.listen([](const Event::SRenderStageEvent& event) {
+        // Only BEGIN and LAST_MOMENT carry the frame's context, which is all we need it for.
+        if (!event.context)
+            return;
+        auto& ctx = event.context->get();
         try {
-            if (stage == RENDER_BEGIN)
-                onRenderBegin();
-            else if (stage == RENDER_LAST_MOMENT)
-                wrapLayers();
+            if (event.stage == RENDER_BEGIN)
+                onRenderBegin(ctx);
+            else if (event.stage == RENDER_LAST_MOMENT)
+                wrapLayers(ctx);
         } catch (const std::exception& e) { fail(std::format("render: {}", e.what())); }
         // After the glass: the cursor goes between its backdrop copy and the surface.
-        if (stage == RENDER_LAST_MOMENT) {
+        if (event.stage == RENDER_LAST_MOMENT) {
             try {
-                tuckCursor();
+                tuckCursor(ctx);
             } catch (const std::exception& e) { log(std::format("cursor: {}", e.what())); }
         }
     });
@@ -131,10 +136,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         announce();
         updateCursorLocks();
     });
-    g_state.command        = HyprlandAPI::registerHyprCtlCommand(PHANDLE, SHyprCtlCommand{.name = "hypreave", .exact = true, .fn = [](eHyprCtlOutputFormat, std::string) {
+    g_state.command        = HyprlandAPI::registerHyprCtlCommand(PHANDLE, IPC::Socket1::SCommand{.name = "hypreave", .handler = [](const IPC::Socket1::SRequest&) {
                                                                       try {
-                                                                          return status();
-                                                                      } catch (const std::exception& e) { return std::format("error: {}\n", e.what()); }
+                                                                          return IPC::Socket1::SResponse{status()};
+                                                                      } catch (const std::exception& e) { return IPC::Socket1::SResponse{std::format("error: {}\n", e.what())}; }
                                                                   }});
 
     return {"hypr-eave", "Liquid glass behind eave's islands", "eave", "0.1.0"};
