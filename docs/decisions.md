@@ -3173,7 +3173,7 @@ A test in `eave-dbus` reproduces it with a connection to itself: an unread strea
 
 ## D-133: Sound follows a device as it arrives
 
-**Status:** accepted (2026-10-23).
+**Status:** accepted (2026-10-23). Amended (2026-11-01): a device is followed only once it has stayed 1 s (*Settling*, below).
 
 **What:** when a device arrives, the volume widget makes it the default output or input:
 - Bluetooth headphones connecting (their mic too, when they have one);
@@ -3187,6 +3187,8 @@ Unplugged from its jack, the default goes back to what it was. A device that dis
 - Virtual devices (an equalizer, a convolver, a null sink) and displays (HDMI, DisplayPort) aren't followed: a monitor waking up isn't a choice to listen there.
 - A device that left less than 5 s ago and comes back isn't new. Bluetooth headphones switching profile for a call come back under another name (`bluez_output.<address>.0` for `.1`), and count as the same device.
 - Two arriving at once (a dock) aren't followed: which one is meant isn't clear.
+
+**Settling:** a device that arrives is followed 1 s later, and only if it's still there (and, for a jack, still plugged in). Following it at once made Asahi's raw speakers the default. WirePlumber's software DSP hides a parent node such as `alsa_output.platform-sound.RawSpeakers` ("Raw Speaker Device (do not use)") from apps by taking away their permissions, but only after the node is added, so pipewire-pulse shows it for a moment each time the node is made. It's ALSA, so it looked like hardware arriving. Set as the default, it stayed the configured one, and WirePlumber, which still sees it, sent music there past the speaker DSP, away from the AirPods or speakers in use. Some of these attempts failed with `NoEntity` because the node was already gone. A second's wait costs nothing for headphones that connect, and covers any node that's hidden right after it appears, not only Asahi's.
 
 **Why in the bar, not the server:**
 - WirePlumber has no "switch to what was just connected": it restores the last default you picked, else the highest-priority device. pipewire-pulse's `module-switch-on-connect` does switch, but follows every new sink, virtual ones and profile flips included, needs PipeWire config the bar shouldn't own, and doesn't see a jack on a device that's already there.
