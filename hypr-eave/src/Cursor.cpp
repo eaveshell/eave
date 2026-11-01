@@ -93,16 +93,16 @@ namespace Glass {
         g_locked.clear();
     }
 
-    void tuckCursor() {
+    void tuckCursor(Render::CRenderContext& ctx) {
         if (!cursorUnder())
             return;
-        auto&      rd  = g_pHyprRenderer->m_renderData;
+        auto&      rd  = ctx.m_data;
         const auto mon = rd.pMonitor.lock();
         const auto tex = Pointer::mgr()->getCurrentCursorTexture();
         if (!mon || !tex)
             return;
 
-        auto& elements = Internals::passElements(g_pHyprRenderer->m_renderPass);
+        auto& elements = Internals::passElements(IHyprRenderer::currentPass(ctx));
         using Elem     = std::remove_cvref_t<decltype(elements)>::value_type;
 
         // Hyprland's software cursor: the last texture that's the cursor's. None with a hardware one.

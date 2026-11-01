@@ -316,10 +316,10 @@ namespace Glass {
     // The glass reads around every pixel it draws, so a change anywhere it can see redraws all of
     // it. Added to this frame's record in the damage ring too, so older buffers catch up. Where the
     // glass was last drawn counts too: a surface that just shrank leaves it there otherwise.
-    void onRenderBegin() {
+    void onRenderBegin(CRenderContext& ctx) {
         if (!enabled())
             return;
-        auto& rd  = g_pHyprRenderer->m_renderData;
+        auto& rd  = ctx.m_data;
         auto  mon = rd.pMonitor.lock();
         if (!mon)
             return;
@@ -575,8 +575,8 @@ namespace Glass {
     }
 
     // Before the surface: copy what's under and around it, and frost it.
-    static void takeBackdrop(SJob& job, CGlassSurface* glass) {
-        auto& rd  = g_pHyprRenderer->m_renderData;
+    static void takeBackdrop(CRenderContext& ctx, SJob& job, CGlassSurface* glass) {
+        auto& rd  = ctx.m_data;
         auto  mon = job.mon.lock();
         if (!enabled() || !mon || !rd.currentFB || rd.damage.copy().intersect(job.box).empty())
             return;
@@ -654,7 +654,7 @@ namespace Glass {
     }
 
     // After the surface: key the glass in where its islands are, refracted at their edges.
-    static void keyGlass(SJob& job) {
+    static void keyGlass(CRenderContext& ctx, SJob& job) {
         auto mon = job.mon.lock();
         if (!job.ready || !mon || !enabled())
             return;
@@ -663,7 +663,7 @@ namespace Glass {
         if (!prog)
             return;
 
-        auto&      rd     = g_pHyprRenderer->m_renderData;
+        auto&      rd     = ctx.m_data;
         const auto fbSize = rd.currentFB->m_size;
         const auto& lk    = job.state.look;
         const float S     = mon->m_scale;
@@ -745,21 +745,21 @@ namespace Glass {
         };
         CGlassElement(SP<SJob> job, eStep step) : m_job(std::move(job)), m_step(step) {}
 
-        std::vector<UP<IPassElement>> draw() override {
+        std::vector<UP<IPassElement>> draw(CRenderContext& ctx) override {
             try {
                 if (m_step == BACKDROP)
-                    takeBackdrop(*m_job, glassOf(m_job->surface.lock().get()));
+                    takeBackdrop(ctx, *m_job, glassOf(m_job->surface.lock().get()));
                 else
-                    keyGlass(*m_job);
+                    keyGlass(ctx, *m_job);
             } catch (const std::exception& e) { fail(std::format("drawing: {}", e.what())); } catch (...) {
                 fail("drawing: unknown exception");
             }
             return {};
         }
-        bool needsLiveBlur() override {
+        bool needsLiveBlur(CRenderContext&) override {
             return false;
         }
-        bool needsPrecomputeBlur() override {
+        bool needsPrecomputeBlur(CRenderContext&) override {
             return false;
         }
         const char* passName() override {
@@ -775,13 +775,13 @@ namespace Glass {
     };
 
     // Wrap each glass surface in the pass with the two steps, now that the pass is built.
-    void wrapLayers() {
-        auto& rd  = g_pHyprRenderer->m_renderData;
+    void wrapLayers(CRenderContext& ctx) {
+        auto& rd  = ctx.m_data;
         auto  mon = rd.pMonitor.lock();
         if (!enabled() || !mon)
             return;
 
-        auto&      elements = Internals::passElements(g_pHyprRenderer->m_renderPass);
+        auto&      elements = Internals::passElements(IHyprRenderer::currentPass(ctx));
         using Elem          = std::remove_cvref_t<decltype(elements)>::value_type;
         const bool isSdr    = sdr(rd.currentFB);
         CRegion    drawn;
@@ -830,7 +830,7 @@ namespace Glass {
     }
 
     void removeElements() {
-        g_pHyprRenderer->m_renderPass.removeAllOfType("CHyprEaveGlassElement");
+        IHyprRenderer::currentPass(g_pHyprRenderer->context()).removeAllOfType("CHyprEaveGlassElement");
     }
 
     void forgetMonitor(void* monitor) {
