@@ -32,6 +32,7 @@ jobs:
   build:
     name: build (${{ matrix.arch }})
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x86_64
@@ -42,11 +43,14 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
             image: menci/archlinuxarm:base-devel
+            # pacman's download sandbox can't apply Landlock in this container. Arch's image
+            # turns it off in its pacman.conf.
+            pacman: --disable-sandbox
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.image }}
     steps:
-      - run: pacman -Syu --noconfirm --needed git rust pkgconf libxkbcommon
-      - uses: actions/checkout@v4
+      - run: pacman -Syu --noconfirm --needed ${{ matrix.pacman }} git rust pkgconf libxkbcommon
+      - uses: actions/checkout@v5
         with:
           ref: ${{ env.TAG }}
       - name: makepkg
@@ -70,7 +74,7 @@ jobs:
           mkdir "$GITHUB_WORKSPACE/out"
           # Not eave-debug, which makepkg splits off where the debug option is on.
           cp "eave-$pkgver"-*.pkg.tar.zst "$GITHUB_WORKSPACE/out/"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.arch }}
           path: out/*.pkg.tar.zst
@@ -88,8 +92,8 @@ jobs:
     steps:
       - run: pacman -Syu --noconfirm --needed github-cli
       # The workflow's own commit, for repo.sh: an older tag may not have it.
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           path: repo
       - name: sign
