@@ -4,7 +4,18 @@ How to install the bar, start it with your session, update it, and what each kin
 
 ## Install
 
-### From the AUR (Arch, CachyOS)
+### From the pacman repository or the AUR (Arch, CachyOS)
+
+eave has a signed pacman repository with the package prebuilt for x86_64 and aarch64 ([D-135](decisions.md)). Trust its key and add it to `/etc/pacman.conf`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/eaveshell/eave/main/dist/pacman/eave.asc | sudo pacman-key --add -
+sudo pacman-key --lsign-key B498F572F57269382E01AE73E8A6AB6E761025F7
+printf '\n[eave]\nServer = https://github.com/eaveshell/eave/releases/download/repo-$arch\n' | sudo tee -a /etc/pacman.conf
+sudo pacman -Syu eave
+```
+
+Or build the same package from the AUR:
 
 ```sh
 paru -S eave
@@ -54,7 +65,7 @@ eave-build update
 
 Nothing changes version until you run this ([D-31](decisions.md)). It fetches eave and every plugin, moves each to the newest commit of its `@rev` (or its default branch), prints what moved, and rebuilds as above. When eave itself moved, it first reinstalls `eave-build` from the new checkout and lets the new one do the rest, so the bar is always built by the matching `eave-build`. It also runs `init`, which rewrites the systemd units (config.toml is kept), and reloads systemd ([D-93](decisions.md)). To stay on a version, pin it: `eave = "eaveshell/eave@<tag>"`, `widget = "someone/weather@v0.2"`.
 
-With the AUR package, eave itself is pinned to the package's release: a config.toml without `eave = …` builds `eaveshell/eave@v<version>`. `paru -Syu` moves eave and `eave-build` together, and the next `eave-build` moves the bar to the new release. Run `eave-build init` after an upgrade to refresh the units. `eave-build update` still updates your plugins, and never reinstalls `eave-build` over the package ([D-54](decisions.md)).
+With the package (from the repository or the AUR), eave itself is pinned to the package's release: a config.toml without `eave = …` builds `eaveshell/eave@v<version>`. `pacman -Syu` (or `paru -Syu`) moves eave and `eave-build` together, and the next `eave-build` moves the bar to the new release. Run `eave-build init` after an upgrade to refresh the units. `eave-build update` still updates your plugins, and never reinstalls `eave-build` over the package ([D-54](decisions.md)).
 
 To see what an update would move first:
 
@@ -72,7 +83,7 @@ From the dormer, the `update` widget does both: Check for updates and Update eav
 systemctl --user disable --now eave.service eave-rebuild.path
 rm ~/.config/systemd/user/eave{,-rebuild,-update,-update-check}.* ~/.local/bin/eave
 rm -r ~/.local/share/eave ~/.cache/eave     # sources and build cache
-cargo uninstall eave-build                  # or, from the AUR: pacman -R eave
+cargo uninstall eave-build                  # or, with the package: pacman -R eave
 ```
 
 `~/.config/eave` is yours to keep or remove.

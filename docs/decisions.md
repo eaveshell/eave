@@ -3231,3 +3231,24 @@ The apps thread runs only while the popover is open.
 **Could be cheaper, in ebb:**
 - A forecast that keeps its models between calls, instead of loading them and catching up from the recording each time.
 - `ebb-store` with fewer SQLite features. It enables FTS, R-tree and JSON, none of which the reader needs.
+
+---
+
+## D-135: A signed pacman repository on GitHub Releases
+
+**Status:** accepted (2026-11-04). Amends [D-54](#d-54-eave-on-the-aur-shipping-eave-build-from-release-tags).
+
+**What:** the AUR package, prebuilt, in a pacman repository named `eave` ([dist/pacman](../dist/pacman/README.md)). `pacman -S eave` then installs eave-build without compiling it first. The bar is still built per user (D-12), so nothing else about D-54 changes: same PKGBUILD, same runtime dependencies, same pinning to the release.
+- **Served from GitHub Releases:** one release per architecture, `repo-x86_64` and `repo-aarch64`, holding the packages, `eave.db`, `eave.files` and their signatures. pacman's `$arch` picks the release: `Server = https://github.com/eaveshell/eave/releases/download/repo-$arch`. Each publish replaces what's there, so the repository holds the latest release only, as pacman repositories do.
+- **Built from each `vX.Y.Z` tag** by [.github/workflows/repo.yml](../.github/workflows/repo.yml), with the tag's own PKGBUILD, which must name that version. x86_64 builds in Arch's image, aarch64 in an Arch Linux ARM image on an arm runner. Running the workflow by hand publishes a tag pushed before it existed.
+- **Signed by CI** with a key of its own (`B498F572F57269382E01AE73E8A6AB6E761025F7`, public half in `dist/pacman/eave.asc`, private half in the `PACMAN_SIGNING_KEY` secret). Users import and locally sign it once, and keep pacman's default `SigLevel`.
+- **The builds never see the key.** They run cargo, so every dependency's build script, and the aarch64 image isn't Arch's own. They hand unsigned packages to a separate job in Arch's official image, which signs them and writes the database (`dist/pacman/repo.sh`).
+
+**Alternatives:**
+- **GitHub Pages:** a nicer URL, but every package would stay in the `gh-pages` history forever.
+- **A server of our own:** one more thing to run and pay for, for a handful of files.
+- **Unsigned, with `SigLevel = Optional TrustAll`:** anyone who could change the release assets could ship code that runs as root.
+- **An `eave-git` package from every main commit:** turned down in D-54 for the same reason: `eave-build update` and the package would both move eave.
+- **An `eave-keyring` package for the key:** the usual way for larger repositories, but it's a second package to build and sign, for one `pacman-key` command.
+
+**Why:** the AUR package compiles eave-build on every upgrade, which takes minutes and a toolchain at install time. A repository makes it a download, and the signature is checked by pacman like any official package's.

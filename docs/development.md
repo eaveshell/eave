@@ -105,7 +105,7 @@ For smoothness: watch animations with Hyprland's debug overlay (`hyprctl keyword
 Three things get versions, each by hand and only when the user asks for it:
 
 - **The crates on crates.io:** `eave-api` and the services (`eave-dbus`, `eave-hyprland`, `eave-iwd`, `eave-bluez`, `eave-mpris`, `eave-net`, `eave-pulse`), so plugins in other repositories build and test on their own ([D-50](decisions.md)). The host, `eave-build` and the built-in plugins aren't published.
-- **eave's release tags:** `vX.Y.Z` on `main`. The AUR package builds `eave-build` from a tag, and a packaged eave-build builds the bar from that same tag ([D-54](decisions.md)).
+- **eave's release tags:** `vX.Y.Z` on `main`. The AUR package builds `eave-build` from a tag, the pacman repository is published from it, and a packaged eave-build builds the bar from that same tag ([D-54, D-135](decisions.md)).
 - **Plugin repositories** (`eaveshell/eave-claude`, `eaveshell/eave-notifications`, …): they depend on the published crates, and their CI builds with `--locked`.
 
 ### Publishing a crate
@@ -121,7 +121,7 @@ Then, in the plugin repository: `cargo update -p <crate>`, raise its requirement
 
 ### Releasing eave
 
-Bump the versions, tag `main` with an annotated `vX.Y.Z` (`git tag -a vX.Y.Z -m "eave X.Y.Z"`), and push the tag. Then update the AUR package: [dist/aur/README.md](../dist/aur/README.md) has the steps. Never move or delete a pushed tag, since the AUR package's checksum is of its tarball. A fix is a new tag.
+Bump the versions and the PKGBUILD's `pkgver`, tag `main` with an annotated `vX.Y.Z` (`git tag -a vX.Y.Z -m "eave X.Y.Z"`), and push the tag. Pushing it publishes the pacman repository ([dist/pacman/README.md](../dist/pacman/README.md)). Then update the AUR package: [dist/aur/README.md](../dist/aur/README.md) has the steps. Never move or delete a pushed tag, since the AUR package's checksum is of its tarball. A fix is a new tag.
 
 ### Merging and pushing
 
