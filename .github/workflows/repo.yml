@@ -69,12 +69,13 @@ jobs:
           git archive --prefix="eave-$pkgver/" -o "$dir/eave-$pkgver.tar.gz" HEAD
           chown -R builder "$dir"
           cd "$dir"
-          # Hyprland isn't installed here: it's a runtime dependency only.
-          su builder -c 'makepkg --nodeps --skipchecksums --noconfirm'
+          # Hyprland isn't installed here: it's a runtime dependency only. Arch Linux ARM's
+          # makepkg defaults to .pkg.tar.xz, and repo.sh takes zstd on both.
+          su builder -c 'PKGEXT=.pkg.tar.zst makepkg --nodeps --skipchecksums --noconfirm'
           mkdir "$GITHUB_WORKSPACE/out"
           # Not eave-debug, which makepkg splits off where the debug option is on.
           cp "eave-$pkgver"-*.pkg.tar.zst "$GITHUB_WORKSPACE/out/"
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.arch }}
           path: out/*.pkg.tar.zst
@@ -93,7 +94,7 @@ jobs:
       - run: pacman -Syu --noconfirm --needed github-cli
       # The workflow's own commit, for repo.sh: an older tag may not have it.
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           path: repo
       - name: sign
