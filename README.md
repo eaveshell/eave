@@ -14,7 +14,7 @@ On Arch or CachyOS, from the [AUR](https://aur.archlinux.org/packages/eave):
 paru -S eave
 ```
 
-It installs `eave-build` and prints the three commands that build the bar and start it. Anywhere else, you need Hyprland, Rust (`cargo`), `git` and `pkg-config` (Arch and CachyOS have it already):
+or prebuilt from eave's signed pacman repository, for x86_64 and aarch64 ([how to add it](dist/pacman/README.md)). It installs `eave-build` and prints the three commands that build the bar and start it. Anywhere else, you need Hyprland, Rust (`cargo`), `git` and `pkg-config` (Arch and CachyOS have it already):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/eaveshell/eave/main/install.sh | sh
@@ -50,7 +50,7 @@ Built-in widgets are `workspaces`, `window`, `clock`, `keyboard`, `volume`, `bri
 eave-build update
 ```
 
-Nothing changes version on its own. This fetches eave and every plugin, rebuilds and restarts the bar. Pin a version with `@tag` to stay on it. With the AUR package, eave itself follows the package: `paru -Syu` updates it, and the next rebuild moves the bar to the new release.
+Nothing changes version on its own. This fetches eave and every plugin, rebuilds and restarts the bar. Pin a version with `@tag` to stay on it. With the package, eave itself follows it: `pacman -Syu` updates it, and the next rebuild moves the bar to the new release.
 
 ## Uninstall
 

@@ -1,0 +1,123 @@
+# eave's pacman repository (D-135): the AUR package, prebuilt for x86_64 and aarch64 from each
+# vX.Y.Z tag, signed, and served from one GitHub release per architecture (repo-x86_64,
+# repo-aarch64). Users add it as https://github.com/eaveshell/eave/releases/download/repo-$arch.
+# To publish a tag that was pushed before this workflow existed, run it by hand with that tag.
+#
+# The builds get no secrets: cargo runs dependencies' build scripts, and the aarch64 image isn't
+# Arch's own. Only the publish job, in the official Arch image, sees the signing key.
+name: Pacman repository
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (vX.Y.Z)
+        required: true
+
+concurrency:
+  group: pacman-repo
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  # dist/pacman/eave.asc. Users lsign this fingerprint.
+  SIGNING_KEY: B498F572F57269382E01AE73E8A6AB6E761025F7
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            image: archlinux:base-devel
+          # Arch Linux ARM has no official image. This one is built from its rootfs tarball, and
+          # everything the build uses comes from ALARM's signed packages through -Syu below.
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: menci/archlinuxarm:base-devel
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    steps:
+      - run: pacman -Syu --noconfirm --needed git rust pkgconf libxkbcommon
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: makepkg
+        # As the CI's aur job, but from the tag, and it fails if the PKGBUILD isn't that release.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          pkgver=$(sed -n 's/^pkgver=//p' dist/aur/eave/PKGBUILD)
+          if [ "v$pkgver" != "$TAG" ]; then
+            echo "::error::dist/aur/eave/PKGBUILD is $pkgver, the tag is $TAG"
+            exit 1
+          fi
+          useradd -m builder
+          dir=/home/builder/eave
+          mkdir "$dir"
+          cp dist/aur/eave/PKGBUILD dist/aur/eave/eave.install "$dir"
+          git archive --prefix="eave-$pkgver/" -o "$dir/eave-$pkgver.tar.gz" HEAD
+          chown -R builder "$dir"
+          cd "$dir"
+          # Hyprland isn't installed here: it's a runtime dependency only.
+          su builder -c 'makepkg --nodeps --skipchecksums --noconfirm'
+          mkdir "$GITHUB_WORKSPACE/out"
+          # Not eave-debug, which makepkg splits off where the debug option is on.
+          cp "eave-$pkgver"-*.pkg.tar.zst "$GITHUB_WORKSPACE/out/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}
+          path: out/*.pkg.tar.zst
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - run: pacman -Syu --noconfirm --needed github-cli
+      # The workflow's own commit, for repo.sh: an older tag may not have it.
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: repo
+      - name: sign
+        env:
+          KEY: ${{ secrets.PACMAN_SIGNING_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::the PACMAN_SIGNING_KEY secret isn't set: dist/pacman/README.md"
+            exit 1
+          fi
+          printf '%s\n' "$KEY" | gpg --batch --import
+          for arch in x86_64 aarch64; do
+            sh dist/pacman/repo.sh "repo/$arch" "$SIGNING_KEY"
+          done
+      - name: upload
+        # Packages first, then the database that names them, then whatever it no longer names.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          for arch in x86_64 aarch64; do
+            release=repo-$arch
+            dir=repo/$arch
+            gh release view "$release" >/dev/null 2>&1 ||
+              gh release create "$release" --target "$GITHUB_SHA" --latest=false \
+                --title "pacman repository ($arch)" \
+                --notes "eave's pacman repository for $arch, rewritten by each release. How to add it: dist/pacman/README.md"
+            gh release upload "$release" --clobber "$dir"/*.pkg.tar.zst "$dir"/*.pkg.tar.zst.sig
+            gh release upload "$release" --clobber "$dir"/eave.db "$dir"/eave.db.sig "$dir"/eave.files "$dir"/eave.files.sig
+            gh release view "$release" --json assets --jq '.assets[].name' | while read -r asset; do
+              [ -e "$dir/$asset" ] || gh release delete-asset "$release" "$asset" --yes
+            done
+          done
