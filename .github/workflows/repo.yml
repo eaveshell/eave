@@ -112,7 +112,6 @@ jobs:
       - name: upload
         # Packages first, then the database that names them, then whatever it no longer names.
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           for arch in x86_64 aarch64; do
             release=repo-$arch
             dir=repo/$arch
